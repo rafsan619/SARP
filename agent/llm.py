@@ -217,6 +217,10 @@ class LLMRouter:
         return any(e.available(max_age) for e in self.endpoints)
 
     def describe(self) -> list[dict]:
+        # Check each endpoint: available() above stops at the first one that works, which would leave the
+        # backup unchecked (and wrongly shown as down) whenever the team PC is up.
+        for e in self.endpoints:
+            e.available()
         return [e.describe() for e in self.endpoints]
 
     def stream_chat(self, messages: list[dict], temperature: float = 0.4) -> Iterator[str]:

@@ -129,6 +129,12 @@ class LLMTest(unittest.TestCase):
             local.available()
             self.assertEqual(local.describe()["problem"], "SARP_LLM_BASE_URL is not set in Vercel")
 
+    def test_status_checks_backup_even_when_pc_is_up(self):
+        router = LLMRouter([Endpoint("primary", "https://pc.example/v1", "gemma3:4b", transport=fake_api()),
+                            Endpoint("backup", "https://api.example/v1", "llama", transport=fake_api(model="llama"))])
+        self.assertTrue(router.available())
+        self.assertEqual([p["available"] for p in router.describe()], [True, True])
+
     def test_backup_answers_when_pc_is_off(self):
         router = LLMRouter([Endpoint("primary", "https://pc.example/v1", "gemma3:4b", transport=down()),
                             Endpoint("backup", "https://api.example/v1", "llama", transport=fake_api(model="llama"))])
