@@ -42,7 +42,8 @@ async function loadList() {
   try { data = await api("/api/counsellor/conversations"); } catch { return; }
   const card = data.model_card;
   const providers = (data.status.providers || [])
-    .map((p) => `${p.name === "primary" ? "team PC" : "backup"} ${p.model} ${p.available ? "up" : "down"}`).join(", ");
+    .map((p) => `${p.name === "primary" ? "team PC" : "backup"} ${p.model} at ${p.host} `
+      + (p.available ? "up" : `down${p.problem ? ` (${p.problem})` : ""}`)).join("; ");
   $("modelCard").textContent = `SARP-Net ${card.model}: ${pct(card.test_accuracy)} accuracy and ROC-AUC ${card.test_roc_auc.toFixed(3)} on held-out records. `
     + `Phase: ${data.political_phase}. AI: ${providers || (data.status.mode === "ai" ? data.status.model : "offline mode")}.`;
   $("list").innerHTML = data.conversations.length ? data.conversations.map((c) => `

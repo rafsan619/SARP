@@ -18,7 +18,7 @@ from fastapi.testclient import TestClient
 
 from agent import llm_gateway, prompts as P, server
 from agent.chat import ChatEngine, Turn
-from agent.llm import Endpoint, LLMRouter
+from agent.llm import Endpoint, LLMRouter, strip_thoughts
 from agent.retriever import Retriever
 from agent.store import Store, database_url
 from agent.test_chat import NoExamples, tool
@@ -29,7 +29,8 @@ def sse(*pieces: str) -> bytes:
     return ("".join(lines) + "data: [DONE]\n\n").encode()
 
 
-def fake_api(model="gemma3:4b", reply=("Hello ", "student"), reject_system=False, fail_chat=False, seen=None):
+def fake_api(model="gemma3:4b", reply=("Hello ", "student"), reject_system=False, fail_chat=False, seen=None,
+             reject_extra=False):
     """A mock OpenAI-compatible server for httpx.MockTransport."""
     def handler(request: httpx.Request) -> httpx.Response:
         if seen is not None:
@@ -39,6 +40,8 @@ def fake_api(model="gemma3:4b", reply=("Hello ", "student"), reject_system=False
         body = json.loads(request.content)
         if fail_chat:
             return httpx.Response(500, json={"error": "boom"})
+        if reject_extra and "extra_body" in body:
+            return httpx.Response(400, json={"error": "Unknown name extra_body"})
         if reject_system and body["messages"][0]["role"] == "system":
             return httpx.Response(400, json={"error": "Developer instruction is not enabled"})
         return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=sse(*reply))
@@ -76,6 +79,55 @@ class LLMTest(unittest.TestCase):
         retried = json.loads(seen[-1].content)["messages"]
         self.assertEqual(retried[0]["role"], "user")
         self.assertIn("Be brief.", retried[0]["content"])
+
+    def test_thought_blocks_never_reach_the_student(self):
+        split = ["<thou", "ght>\n- User Question: ...\n- Constraints: ...</tho", "ught>\n\nGermany and ", "Malaysia fit."]
+        self.assertEqual("".join(strip_thoughts(iter(split))), "Germany and Malaysia fit.")
+        self.assertEqual("".join(strip_thoughts(iter(["<think>x</think>A", " <thinking>y</thinking>B"]))), "A B")
+        self.assertEqual("".join(strip_thoughts(iter(["Budget < 15 lakh", " is tight."]))), "Budget < 15 lakh is tight.")
+        self.assertEqual("".join(strip_thoughts(iter(["<thought>never closed"]))), "")
+        ep = Endpoint("backup", "https://api.example/v1", "m",
+                      transport=fake_api(model="m", reply=("<thought>plan</thought>", "Hello ", "student")))
+        self.assertTrue(ep.available())
+        self.assertEqual("".join(ep.stream_chat(MESSAGES)), "Hello student")
+
+    def test_google_gemma_asked_not_to_think(self):
+        seen = []
+        ep = Endpoint("backup", "https://generativelanguage.googleapis.com/v1beta/openai", "gemma-4-26b-a4b-it",
+                      transport=fake_api(model="models/gemma-4-26b-a4b-it", seen=seen))
+        self.assertTrue(ep.available())
+        self.assertEqual("".join(ep.stream_chat(MESSAGES)), "Hello student")
+        config = json.loads(seen[-1].content)["extra_body"]["google"]["thinking_config"]
+        self.assertEqual((config["thinking_level"], config["include_thoughts"]), ("minimal", False))
+        # Other providers never get Google's option.
+        other = []
+        Endpoint("primary", "https://pc.example/v1", "gemma3:4b", transport=fake_api(seen=other)).available()
+        list(Endpoint("primary", "https://pc.example/v1", "gemma3:4b", transport=fake_api(seen=other)).stream_chat(MESSAGES))
+        self.assertNotIn("extra_body", json.loads(other[-1].content))
+
+    def test_rejected_option_is_retried_without_it(self):
+        seen = []
+        ep = Endpoint("backup", "https://generativelanguage.googleapis.com/v1beta/openai", "gemma-4-26b-a4b-it",
+                      transport=fake_api(model="gemma-4-26b-a4b-it", reject_extra=True, seen=seen))
+        self.assertTrue(ep.available())
+        self.assertEqual("".join(ep.stream_chat(MESSAGES)), "Hello student")
+        self.assertNotIn("extra_body", json.loads(seen[-1].content))
+
+    def test_counsellors_see_why_the_pc_is_down(self):
+        refused = httpx.MockTransport(lambda request: httpx.Response(401, json={"detail": "Invalid or missing key"}))
+        ep = Endpoint("primary", "https://pc.example/v1", "gemma3:4b", "wrong", transport=refused)
+        self.assertFalse(ep.available())
+        self.assertEqual(ep.describe()["problem"], "HTTP 401: the key was refused")
+        ep = Endpoint("primary", "https://pc.example/v1", "sarp-agent", transport=fake_api(model="gemma3:4b"))
+        ep.available()
+        self.assertEqual(ep.describe()["problem"], "model sarp-agent is not offered there")
+        ep = Endpoint("primary", "https://pc.example/v1", "gemma3:4b", transport=down())
+        ep.available()
+        self.assertIn("not reachable", ep.describe()["problem"])
+        with mock.patch.dict(os.environ, {"VERCEL": "1"}):  # online, but the PC address was never set
+            local = Endpoint("primary", "http://127.0.0.1:11434/v1", "gemma3:4b", transport=down())
+            local.available()
+            self.assertEqual(local.describe()["problem"], "SARP_LLM_BASE_URL is not set in Vercel")
 
     def test_backup_answers_when_pc_is_off(self):
         router = LLMRouter([Endpoint("primary", "https://pc.example/v1", "gemma3:4b", transport=down()),

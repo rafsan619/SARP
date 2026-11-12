@@ -27,6 +27,42 @@ DEFAULT_BASE_URL = "http://127.0.0.1:11434/v1"
 DEFAULT_MODEL = "gemma3:4b"
 # ngrok's free plan shows a browser warning page unless this header is present; other APIs ignore it.
 EXTRA_HEADERS = {"ngrok-skip-browser-warning": "1"}
+# Reasoning that some models write into the reply itself (e.g. Gemma 4 on Google's API uses <thought>).
+THOUGHT_TAGS = ("thought", "think", "thinking", "reasoning")
+
+
+def strip_thoughts(chunks: Iterator[str]) -> Iterator[str]:
+    """Drop <thought>...</thought> (and similar) blocks from a stream, even when a tag is split across chunks."""
+    opens = [f"<{t}>" for t in THOUGHT_TAGS]
+    keep = max(len(t) for t in opens) + 2  # enough to hold a tag cut in half
+    buffer, closing = "", None
+    for chunk in chunks:
+        buffer += chunk
+        while True:
+            if closing:  # inside a thought block: discard up to its closing tag
+                end = buffer.lower().find(closing)
+                if end < 0:
+                    buffer = buffer[-keep:]
+                    break
+                buffer, closing = buffer[end + len(closing):].lstrip(), None
+                continue
+            lower = buffer.lower()
+            hits = [(lower.find(t), t) for t in opens if lower.find(t) >= 0]
+            if hits:
+                start, tag = min(hits)
+                if buffer[:start]:
+                    yield buffer[:start]
+                buffer, closing = buffer[start + len(tag):], tag.replace("<", "</")
+                continue
+            # No full tag: send everything except a tail that might be the start of one.
+            cut = buffer.rfind("<")
+            safe = len(buffer) if cut < 0 or len(buffer) - cut > keep else cut
+            if buffer[:safe]:
+                yield buffer[:safe]
+            buffer = buffer[safe:]
+            break
+    if buffer and not closing:
+        yield buffer
 
 
 @dataclass
@@ -38,6 +74,7 @@ class Endpoint:
     transport: httpx.BaseTransport | None = None  # tests inject a mock transport
     _checked_at: float = field(default=0.0, repr=False)
     _ok: bool = field(default=False, repr=False)
+    _problem: str | None = field(default=None, repr=False)  # why it is down, shown to counsellors
 
     def __post_init__(self) -> None:
         self.base_url = self.base_url.rstrip("/")
@@ -58,33 +95,64 @@ class Endpoint:
         if time.time() - self._checked_at < max_age:
             return self._ok
         self._checked_at = time.time()
+        self._ok, self._problem = False, None
         try:
-            with self._client(3.0) as client:
+            with self._client(5.0) as client:
                 response = client.get(f"{self.base_url}/models")
-                response.raise_for_status()
-                ids = {str(m.get("id", "")) for m in response.json().get("data", [])}
+            if response.status_code in (401, 403):
+                self._problem = f"HTTP {response.status_code}: the key was refused"
+                return False
+            response.raise_for_status()
+            ids = {str(m.get("id", "")) for m in response.json().get("data", [])}
             m = self.model
             self._ok = not ids or any(i in (m, f"{m}:latest") or i.endswith("/" + m) for i in ids)
-        except (httpx.HTTPError, ValueError):
-            self._ok = False
+            if not self._ok:
+                self._problem = f"model {m} is not offered there"
+        except httpx.HTTPStatusError as error:
+            self._problem = f"HTTP {error.response.status_code}"
+        except httpx.TimeoutException:
+            self._problem = "no answer within 5 s"
+        except httpx.HTTPError as error:
+            self._problem = f"not reachable ({type(error).__name__})"
+        except ValueError:
+            self._problem = "unexpected reply (not an AI endpoint?)"
         return self._ok
 
-    def mark_down(self) -> None:
+    def mark_down(self, problem: str | None = None) -> None:
         self._ok, self._checked_at = False, time.time()
+        self._problem = problem or self._problem
+
+    def provider_options(self) -> dict | None:
+        """Extra request fields for specific providers."""
+        if "generativelanguage.googleapis.com" in self.base_url and self.model.startswith("gemma"):
+            # Gemma 4 on Google's API thinks before answering unless told otherwise; "minimal" turns it off.
+            return {"extra_body": {"google": {"thinking_config": {"thinking_level": "minimal",
+                                                                  "include_thoughts": False}}}}
+        return None
 
     def stream_chat(self, messages: list[dict], temperature: float = 0.4, max_tokens: int = 700) -> Iterator[str]:
-        try:
-            yield from self._stream(messages, temperature, max_tokens)
-        except httpx.HTTPStatusError as error:
-            # Some hosted Gemma APIs reject system messages; retry once with it folded into the first turn.
-            if error.response.status_code == 400 and messages and messages[0]["role"] == "system":
-                yield from self._stream(_fold_system(messages), temperature, max_tokens)
-            else:
-                raise
+        # If the provider rejects a request (400), retry with the system message folded into the first turn
+        # (some hosted Gemma APIs refuse system messages) and then without provider-specific options.
+        variants = [messages] + ([_fold_system(messages)] if messages and messages[0]["role"] == "system" else [])
+        options = [self.provider_options()]
+        if options[0]:
+            options.append(None)
+        error: httpx.HTTPStatusError | None = None
+        for extra in options:
+            for msgs in variants:
+                try:
+                    yield from strip_thoughts(self._stream(msgs, temperature, max_tokens, extra))
+                    return
+                except httpx.HTTPStatusError as rejected:
+                    if rejected.response.status_code != 400:
+                        raise
+                    error = rejected
+        raise error
 
-    def _stream(self, messages: list[dict], temperature: float, max_tokens: int) -> Iterator[str]:
+    def _stream(self, messages: list[dict], temperature: float, max_tokens: int,
+                extra: dict | None = None) -> Iterator[str]:
         payload = {"model": self.model, "messages": messages, "stream": True,
-                   "temperature": temperature, "max_tokens": max_tokens}
+                   "temperature": temperature, "max_tokens": max_tokens, **(extra or {})}
         with self._client(httpx.Timeout(120, connect=5)) as client:
             with client.stream("POST", f"{self.base_url}/chat/completions", json=payload) as response:
                 if response.status_code >= 400:
@@ -105,8 +173,11 @@ class Endpoint:
                             yield text
 
     def describe(self) -> dict:
+        problem = self._problem
+        if not self._ok and self.is_local_ollama and os.environ.get("VERCEL"):
+            problem = "SARP_LLM_BASE_URL is not set in Vercel"
         return {"name": self.name, "model": self.model, "host": urlparse(self.base_url).hostname,
-                "available": self._ok}
+                "available": self._ok, "problem": None if self._ok else problem}
 
 
 def _fold_system(messages: list[dict]) -> list[dict]:
@@ -164,7 +235,7 @@ class LLMRouter:
                     return
                 problems.append(f"{endpoint.name} sent an empty reply")
             except Exception as error:
-                endpoint.mark_down()
+                endpoint.mark_down(f"reply failed ({type(error).__name__})")
                 if started:
                     raise  # failed mid-reply: the chat engine adds a "cut short" note
                 problems.append(f"{endpoint.name}: {type(error).__name__}")
