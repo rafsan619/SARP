@@ -383,9 +383,12 @@ function renderChips(msg, chips) {
   chips.forEach((chip) => {
     const b = document.createElement("button");
     b.type = "button";
-    b.className = `chip${chip.skip ? " skip" : ""}`;
+    b.className = `chip${chip.skip ? " skip" : ""}${chip.kind === "suggest" ? " suggest" : ""}`;
     b.textContent = chip.label;
-    b.addEventListener("click", () => send(chip.label, { field: chip.field, value: chip.value ?? null, skip: !!chip.skip }));
+    // Suggested questions are sent like typed messages; answer buttons set a plan detail directly.
+    b.addEventListener("click", () => (chip.kind === "suggest"
+      ? send(chip.label)
+      : send(chip.label, { field: chip.field, value: chip.value ?? null, skip: !!chip.skip })));
     box.appendChild(b);
   });
   msg.extras.appendChild(box);

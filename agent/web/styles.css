@@ -309,6 +309,8 @@ button { cursor: pointer; }
 }
 .chip:hover { border-color: var(--green); background: var(--green-tint); }
 .chip.skip { border-style: dashed; color: var(--muted); }
+.chip.suggest { border-color: color-mix(in srgb, var(--green) 45%, var(--line-strong)); color: var(--green); }
+.chip.suggest:hover { color: var(--ink); }
 
 /* ------------------------------------------------------------------ composer */
 .composer-wrap { padding: 6px 18px 12px; background: linear-gradient(to bottom, transparent, var(--paper) 30%); }

@@ -13,6 +13,14 @@ param(
 )
 $ErrorActionPreference = "Stop"
 
+# Values saved with `setx` reach only windows opened later; read them directly so any window works.
+if (-not $env:SARP_GATEWAY_KEY) {
+    $env:SARP_GATEWAY_KEY = [Environment]::GetEnvironmentVariable("SARP_GATEWAY_KEY", "User")
+}
+if (-not $Domain) {
+    $Domain = [Environment]::GetEnvironmentVariable("SARP_NGROK_DOMAIN", "User")
+}
+
 if (-not $env:SARP_GATEWAY_KEY) {
     Write-Error "Set SARP_GATEWAY_KEY first, for example: `$env:SARP_GATEWAY_KEY = '<key>'"
     exit 1
@@ -37,7 +45,8 @@ Start-Sleep -Seconds 4
 Write-Host "Opening the tunnel at https://$Domain  (set SARP_LLM_BASE_URL=https://$Domain/v1 on Vercel)"
 Write-Host "Press Ctrl+C to stop both."
 try {
-    ngrok http $Port --url "https://$Domain"
+    # --domain works on both older and newer ngrok versions (newer ones also accept --url).
+    ngrok http $Port --domain=$Domain
 }
 finally {
     if ($gateway -and -not $gateway.HasExited) { Stop-Process -Id $gateway.Id }

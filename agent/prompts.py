@@ -122,15 +122,82 @@ RETRIEVED_PREFIX = {
     "banglish": "Amader counsellor-ra sadharonoto eta erokom bhabe bolen:",
     "bengali": "আমাদের কাউন্সেলররা সাধারণত এভাবে উত্তর দেন:",
 }
-PLAN_INTRO = {
-    "english": "Thanks, I have a good picture of your plan now. Here is what I'd focus on next:",
-    "banglish": "Dhonnobad, apnar plan-ta ekhon bujhte perechi. Ami next e egulo-te focus korte boli:",
-    "bengali": "ধন্যবাদ, আপনার পরিকল্পনাটা এখন বুঝতে পেরেছি। আমি এরপর এগুলোতে মনোযোগ দিতে বলব:",
+# ---- The plan message, shared once all five details are known. It recaps, gives next steps for where the
+# student is, and invites them to keep going; it never sounds like the end of the conversation.
+PLAN_SUMMARY = {
+    "english": "Your plan is taking shape: {summary}.",
+    "banglish": "Apnar plan toiri hocche: {summary}.",
+    "bengali": "আপনার পরিকল্পনা তৈরি হচ্ছে: {summary}।",
 }
-PLAN_ALL_GOOD = {
-    "english": "Your plan looks well prepared. Keep your documents ready and check deadlines with your counsellor.",
-    "banglish": "Apnar plan bhalo bhabe ready ache. Documents ready rakhun ar deadline counsellor-er sathe confirm korun.",
-    "bengali": "আপনার পরিকল্পনা ভালোভাবে তৈরি। ডকুমেন্ট তৈরি রাখুন আর ডেডলাইন কাউন্সেলরের সাথে নিশ্চিত করুন।",
+SUMMARY_PARTS = {  # how each known detail reads inside the summary line
+    "intake": {"english": "{v} intake", "banglish": "{v} intake", "bengali": "{v} ইনটেক"},
+    "budget": {"english": "budget {v}", "banglish": "budget {v}", "bengali": "বাজেট {v}"},
+    "gpa": {"english": "result {v}", "banglish": "result {v}", "bengali": "রেজাল্ট {v}"},
+}
+NEXT_STEPS_INTRO = {
+    "english": "Here's what I'd do next:",
+    "banglish": "Ami next e egulo korte boli:",
+    "bengali": "এরপর আমি এগুলো করতে বলব:",
+}
+RESEARCH_STEP = {  # the next step from the student's current research level
+    "No": {
+        "english": "Choose a subject you enjoy and a country that fits your budget. I can help you compare options.",
+        "banglish": "Apnar pochonder subject ar budget-er sathe mile emon desh thik korun. Option compare korte ami help korbo.",
+        "bengali": "পছন্দের বিষয় আর বাজেটের সাথে মেলে এমন দেশ বেছে নিন। বিকল্পগুলো তুলনা করতে আমি সাহায্য করব।",
+    },
+    "Yes Low": {
+        "english": "Shortlist 3 to 5 courses or universities in {country} that match your result and budget.",
+        "banglish": "{country}-e apnar result ar budget-er sathe mile emon 3 theke 5 ta course ba university shortlist korun.",
+        "bengali": "{country}-এ আপনার রেজাল্ট আর বাজেটের সাথে মেলে এমন ৩ থেকে ৫টি কোর্স বা ইউনিভার্সিটি শর্টলিস্ট করুন।",
+    },
+    "Yes Medium": {
+        "english": "Compare the entry requirements, total costs and deadlines of the options on your shortlist.",
+        "banglish": "Apnar shortlist-er option gulor entry requirement, mot khoroch ar deadline compare korun.",
+        "bengali": "শর্টলিস্টের বিকল্পগুলোর ভর্তির যোগ্যতা, মোট খরচ আর ডেডলাইন তুলনা করুন।",
+    },
+    "Yes High": {
+        "english": "Get your documents ready: transcripts, passport, English test result and proof of funds.",
+        "banglish": "Documents ready korun: transcript, passport, English test result ar fund-er proof.",
+        "bengali": "ডকুমেন্ট তৈরি রাখুন: ট্রান্সক্রিপ্ট, পাসপোর্ট, ইংরেজি পরীক্ষার রেজাল্ট আর টাকার প্রমাণ।",
+    },
+}
+COURSE_STEP = {
+    "english": "Decide which subject you want to study, and I can suggest courses that fit your result.",
+    "banglish": "Kon subject porte chan sheta thik korun, ami apnar result-er sathe mile emon course suggest korte parbo.",
+    "bengali": "কোন বিষয়ে পড়তে চান তা ঠিক করুন, আপনার রেজাল্টের সাথে মেলে এমন কোর্স আমি সাজেস্ট করতে পারব।",
+}
+DEADLINE_STEP = {
+    "english": "Check application deadlines for the {intake} intake early, so there is enough time for the visa.",
+    "banglish": "{intake} intake-er application deadline age thekei dekhe rakhun, jate visa-r jonno jothesto shomoy thake.",
+    "bengali": "{intake} ইনটেকের আবেদনের ডেডলাইন আগে থেকেই দেখে রাখুন, যাতে ভিসার জন্য যথেষ্ট সময় থাকে।",
+}
+PLAN_ASK = {
+    "english": "What would you like to look at first?",
+    "banglish": "Prothome kon ta niye kotha bolben?",
+    "bengali": "প্রথমে কোনটা নিয়ে কথা বলবেন?",
+}
+SUGGESTIONS = {  # tappable follow-up questions shown under the plan
+    "choose_course": {"english": "Help me choose a subject", "banglish": "Subject choose korte help korun",
+                      "bengali": "বিষয় বাছাইয়ে সাহায্য করুন"},
+    "universities": {"english": "Which universities in {country} suit me?",
+                     "banglish": "{country}-e kon university amar jonno bhalo?",
+                     "bengali": "{country}-এ কোন ইউনিভার্সিটি আমার জন্য ভালো?"},
+    "documents": {"english": "What documents do I need?", "banglish": "Ki ki documents lagbe?",
+                  "bengali": "কী কী ডকুমেন্ট লাগবে?"},
+    "scholarship": {"english": "How can I get a scholarship?", "banglish": "Scholarship kivabe pabo?",
+                    "bengali": "স্কলারশিপ কীভাবে পাব?"},
+    "budget": {"english": "Is my budget enough?", "banglish": "Amar budget ki jothesto?",
+               "bengali": "আমার বাজেট কি যথেষ্ট?"},
+}
+ACK_DETAIL = {  # repeats back what was understood, so a misreading is easy to spot
+    "english": "Got it: {items}.",
+    "banglish": "Thik ache, note korlam: {items}.",
+    "bengali": "ঠিক আছে, লিখে রাখলাম: {items}।",
+}
+SKIP_ACK = {
+    "english": "No problem, we can come back to that later.",
+    "banglish": "Kono shomossha nai, pore dekhbo.",
+    "bengali": "সমস্যা নেই, পরে দেখে নেব।",
 }
 STUDENT_TOPICS = {
     "help_research": {

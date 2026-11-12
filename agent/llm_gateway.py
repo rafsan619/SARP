@@ -7,7 +7,7 @@ tunnel such as ngrok, then point the website at it.
 On the PC (PowerShell), from the repository root:
     $env:SARP_GATEWAY_KEY = "<long random key>"       # e.g. python -c "import secrets; print(secrets.token_urlsafe(32))"
     .venv\\Scripts\\python.exe -m agent.llm_gateway      # listens on 127.0.0.1:8787
-    ngrok http 8787 --url https://<your-static-domain>.ngrok-free.app
+    ngrok http 8787 --domain=<your-static-domain>.ngrok-free.app
 On Vercel:
     SARP_LLM_BASE_URL = https://<your-static-domain>.ngrok-free.app/v1
     SARP_LLM_API_KEY  = <the same key>
@@ -115,7 +115,7 @@ def main() -> None:
         print("Warning: Ollama did not respond; start Ollama before students use the site.")
     port = int(os.environ.get("SARP_GATEWAY_PORT", "8787"))
     print(f"SARP-Agent model gateway on http://127.0.0.1:{port} (model {model}). Expose it with: "
-          f"ngrok http {port} --url https://<your-static-domain>")
+          f"ngrok http {port} --domain=<your-static-domain>")
     uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")
 
 

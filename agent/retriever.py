@@ -64,12 +64,16 @@ class Retriever:
     def __len__(self) -> int:
         return len(self.exchanges)
 
-    def search(self, text: str, language: str | None = None, k: int = 3, min_score: float = 0.12) -> list[dict]:
+    def search(self, text: str, language: str | None = None, k: int = 3, min_score: float = 0.12,
+               min_answer_words: int = 0) -> list[dict]:
+        """Best-matching exchanges. min_answer_words skips short replies that only made sense in their own chat."""
         if not self.vectorizer or not text.strip():
             return []
         scores = linear_kernel(self.vectorizer.transform([text]), self.matrix)[0]
         ranked = []
-        for i in scores.argsort()[::-1][: k * 6]:
+        candidates = [i for i in scores.argsort()[::-1]
+                      if len(self.exchanges[i]["answer"].split()) >= min_answer_words]
+        for i in candidates[: k * 6]:
             score = float(scores[i]) + (0.05 if language and self.exchanges[i]["language"] == language else 0.0)
             if score >= min_score:
                 ranked.append({**self.exchanges[i], "score": round(score, 3)})

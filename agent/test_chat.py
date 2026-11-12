@@ -124,14 +124,17 @@ class EngineTest(unittest.TestCase):
         self.assertIn(P.QUESTIONS["budget"]["banglish"], reply)
         cid, reply, chips, _ = run(engine, "client-0001", "18 lakh", cid)
         self.assertIn(P.QUESTIONS["gpa"]["banglish"], reply)
+        self.assertIn("18 lakh taka", reply)  # the reply repeats back what it understood
         cid, reply, chips, _ = run(engine, "client-0001", "3.1", cid)
         self.assertEqual([c["value"] for c in chips if not c.get("skip")], P.DUE_DILIGENCE_VALUES)
         cid, reply, chips, events = run(engine, "client-0001", "Ekhono kichu dekhini", cid,
                                         {"field": "due_diligence", "value": "No"})
         # The plan quotes the project's records for the current phase (Newly Elected: 18% vs up to 99%).
-        self.assertIn(P.STUDENT_TOPICS["help_research"]["banglish"], reply)
+        self.assertIn(P.RESEARCH_STEP["No"]["banglish"], reply)
         self.assertIn("(18%)", reply)
         self.assertIn("99%", reply)
+        self.assertTrue(reply.rstrip().endswith(P.PLAN_ASK["banglish"]))  # invites the student to continue
+        self.assertTrue(chips and all(c["kind"] == "suggest" for c in chips))
         plan = next(e["plan"] for e in events if e["type"] == "plan")
         self.assertTrue(plan["complete"])
         state = engine.store.get_conversation(cid)["state"]
@@ -141,6 +144,32 @@ class EngineTest(unittest.TestCase):
         transcript = " ".join(m["content"] for m in engine.store.messages(cid)).lower()
         self.assertNotIn("risk", transcript)
         self.assertNotIn(f"{view['probability'] * 100:.1f}", transcript)
+
+    def test_plan_message_continues_the_conversation(self):
+        """The Ireland chat from user testing: the plan must not read like a goodbye."""
+        engine = make_engine()
+        cid, _, _, _ = run(engine, "client-0008", "I want to study in Ireland")
+        cid, _, _, _ = run(engine, "client-0008", "September 2027", cid, {"field": "intake", "value": "2027-09"})
+        cid, _, _, _ = run(engine, "client-0008", "20 lakh taka or more", cid,
+                           {"field": "budget_band", "value": "16-20K"})
+        cid, reply, _, _ = run(engine, "client-0008", "cgpa 2.9", cid)
+        self.assertIn("Got it: 2.90 / 4.", reply)
+        cid, reply, chips, _ = run(engine, "client-0008", "I know the country and subject", cid,
+                                   {"field": "due_diligence", "value": "Yes Low"})
+        self.assertIn("Your plan is taking shape: Ireland, September 2027 intake", reply)
+        self.assertIn("Shortlist 3 to 5 courses or universities in Ireland", reply)
+        self.assertIn(P.COURSE_STEP["english"], reply)  # course not given yet
+        self.assertIn("September 2027 intake early", reply)
+        self.assertTrue(reply.rstrip().endswith(P.PLAN_ASK["english"]))
+        self.assertNotIn("well prepared", reply)
+        self.assertEqual([c["label"] for c in chips][:2],
+                         ["Help me choose a subject", "Which universities in Ireland suit me?"])
+        # Tapping a suggestion that repeats a known detail must not repeat the plan.
+        _, reply, _, _ = run(engine, "client-0008", "Which universities in Ireland suit me?", cid)
+        self.assertNotIn("Your plan is taking shape", reply)
+        # A real change (new country) does share an updated plan.
+        _, reply, _, _ = run(engine, "client-0008", "Actually I want to study in Canada", cid)
+        self.assertIn("Your plan is taking shape: Canada", reply)
 
     def test_skip_is_not_asked_again(self):
         engine = make_engine()

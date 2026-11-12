@@ -168,6 +168,7 @@ class ChatEngine:
         awaiting = state.get("awaiting")
         updates, skipped = self._read_profile(turn, text, awaiting)
         profile = state["profile"]
+        before = dict(profile)
         if "budget_band" in updates:
             profile.pop("budget_amount", None)
             profile.pop("budget_unit", None)
@@ -177,6 +178,8 @@ class ChatEngine:
             profile.pop("gpa_scale", None)
         profile.update({k: v for k, v in updates.items() if v is not None})
         learned = {FIELD_OF_KEY.get(k, k) for k, v in updates.items() if v is not None}
+        # Only a real change re-shares the plan: "Which universities in Ireland suit me?" repeats the country.
+        changed = {FIELD_OF_KEY.get(k, k) for k, v in updates.items() if v is not None and before.get(k) != v}
         state["skipped"] = [f for f in dict.fromkeys(state["skipped"] + skipped) if f not in learned]
 
         intent = None if turn.quick_reply else detect_intent(text)
@@ -193,12 +196,14 @@ class ChatEngine:
         if intent not in ("handoff", "integrity"):
             next_field = next((f for f in P.CONVERSATION_ORDER if f in missing and f not in state["skipped"]
                                and state["asked"].get(f, 0) < 2), None)
-        share_plan = result["status"] == "ok" and (not state.get("plan_shared") or bool(learned & set(REQUIRED_FIELDS)))
+        share_plan = result["status"] == "ok" and (not state.get("plan_shared") or bool(changed & set(REQUIRED_FIELDS)))
         yield {"type": "plan", "plan": self.plan_card(state, lang)}
 
         after = []  # fixed text that follows the main answer
+        plan_chips: list[dict] = []
         if share_plan:
-            after.append(self._plan_text(result, lang))
+            plan_text, plan_chips = self._plan_text(result, state, lang)
+            after.append(plan_text)
         if next_field:
             after.append(P.QUESTIONS[next_field][lang])
 
@@ -209,13 +214,13 @@ class ChatEngine:
         elif intent == "greeting":
             head = P.GREETING_REPLY[lang]
         elif data_only:
-            head = "" if share_plan else P.ack(lang)
+            head = "" if share_plan else self._ack(state, learned, skipped, lang)  # the plan recaps instead
         else:
             head = None  # open question: the language model answers
 
         message_id = self.store.add_message(cid, "assistant", "")
         out: list[str] = []
-        chips = P.chips_for(next_field, lang, self.tool.bdt_per_usd) if next_field else []
+        chips = P.chips_for(next_field, lang, self.tool.bdt_per_usd) if next_field else plan_chips
         try:
             if head is None:
                 yield from self._model_answer(cid, text, lang, state, result, share_plan, out)
@@ -265,18 +270,55 @@ class ChatEngine:
             if self.type_delay:
                 time.sleep(self.type_delay)
 
-    def _plan_text(self, result: dict, lang: str) -> str:
+    def _ack(self, state: dict, learned: set, skipped: list, lang: str) -> str:
+        """Short reply to a profile answer that repeats back what was understood."""
+        if skipped and not learned:
+            return P.SKIP_ACK[lang]
+        items = self.plan_card(state, lang)["items"]
+        order = ["country", "course", "institution", "intake", "budget", "gpa", "due_diligence"]
+        key = {"due_diligence": "research"}
+        values = [items[key.get(f, f)] for f in order if f in learned and items.get(key.get(f, f))]
+        return P.ACK_DETAIL[lang].format(items=", ".join(values)) if values else P.ack(lang)
+
+    def _plan_text(self, result: dict, state: dict, lang: str) -> tuple[str, list[dict]]:
+        """The plan message (recap, next steps, records fact, question) and its suggested follow-ups."""
+        items = self.plan_card(state, lang)["items"]
         focus = result["student_guidance"]["focus"]
-        if not focus:
-            return P.PLAN_ALL_GOOD[lang]
-        lines = [P.PLAN_INTRO[lang], ""] + [f"- {P.STUDENT_TOPICS[f][lang]}" for f in focus]
+        research = state["profile"].get("due_diligence", "No")
+        country, intake = items.get("country") or "", items.get("intake") or ""
+
+        parts = [items["country"], items.get("course")]
+        parts += [P.SUMMARY_PARTS[k][lang].format(v=items[k]) for k in ("intake", "budget", "gpa") if items.get(k)]
+        summary = P.PLAN_SUMMARY[lang].format(summary=", ".join(p for p in parts if p))
+
+        # Next steps: where the student is now, then what SARP-Net says is pulling their prediction down.
+        steps = [P.RESEARCH_STEP.get(research, P.RESEARCH_STEP["No"])[lang].format(country=country)]
+        for f in focus:
+            if f == "help_research":
+                continue  # covered by the research step above
+            if f == "timing":
+                steps.append(P.DEADLINE_STEP[lang].format(intake=intake))
+            else:
+                steps.append(P.STUDENT_TOPICS[f][lang])
+        if not items.get("course"):
+            steps.append(P.COURSE_STEP[lang])
+        if "timing" not in focus and intake:
+            steps.append(P.DEADLINE_STEP[lang].format(intake=intake))
+        steps = list(dict.fromkeys(steps))[:4]
+
+        lines = [summary, "", P.NEXT_STEPS_INTRO[lang], ""] + [f"- {s}" for s in steps]
         if "help_research" in focus:
             phase = result["counsellor_view"]["model_profile"]["Political_Phase"]
             rates = self.tool.findings.due_diligence_by_phase.get(phase)
             if rates:
                 high = max(rates[level] for level in ("Yes Low", "Yes Medium", "Yes High"))
                 lines += ["", P.RESEARCH_FACT[lang].format(hi=_pct(high, lang), lo=_pct(rates["No"], lang))]
-        return "\n".join(lines)
+        lines += ["", P.PLAN_ASK[lang]]
+
+        keys = (["choose_course"] if not items.get("course") else []) + ["universities", "documents"]
+        keys.append("budget" if "funding_plan" in focus else "scholarship")
+        chips = [{"label": P.SUGGESTIONS[k][lang].format(country=country), "kind": "suggest"} for k in keys]
+        return "\n".join(lines), chips
 
     def _known_details(self, state: dict) -> str:
         items = self.plan_card(state, "english")["items"]
@@ -286,7 +328,9 @@ class ChatEngine:
 
     def _model_answer(self, cid: str, text: str, lang: str, state: dict, result: dict, share_plan: bool,
                       out: list[str]) -> Iterator[dict]:
-        examples = self.retriever.search(text, lang, k=2, min_score=0.22)
+        # A high bar: weak matches share words but not meaning, and short replies only made sense in their own
+        # chat; a small model copies both. Without a good example it answers from general knowledge.
+        examples = self.retriever.search(text, lang, k=2, min_score=0.4, min_answer_words=20)
         if self.llm.available():
             context = [P.SYSTEM_PROMPT, P.REPLY_RULES.format(language=P.LANGUAGE_NAMES[lang]),
                        f"Details the student has already shared: {self._known_details(state)}."]
@@ -297,8 +341,9 @@ class ChatEngine:
                            + (" and a short personal plan" if share_plan else "")
                            + ", so answer only what the student asked and do not ask for their details.")
             if examples:
-                context.append("Real answers from our counsellors to similar questions. Use one only if it is about "
-                               "the same topic; ignore personal details that do not apply to this student:\n\n"
+                context.append("Past answers our counsellors gave OTHER students in other conversations. Use one only "
+                               "if it clearly answers this student's question; never copy its wording, never start "
+                               "with its 'Yes' or 'No', and ignore personal details that do not apply:\n\n"
                                + "\n\n".join(f"Student: {e['question']}\nCounsellor: {e['answer']}" for e in examples))
             system = "\n\n".join(context)
             messages = [{"role": "system", "content": system}]
