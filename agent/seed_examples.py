@@ -14,6 +14,7 @@ import argparse
 import sys
 from pathlib import Path
 
+from agent.cases import cases_from_files
 from agent.retriever import DEFAULT_DATA_DIR, exchanges_from_files
 from agent.store import Store
 
@@ -30,7 +31,8 @@ def main() -> None:
     if store.backend != "postgresql":
         print("Note: DATABASE_URL is not set, so this fills the local SQLite database, not the online one.")
     count = store.replace_examples(exchanges)
-    print(f"Uploaded {count} counsellor examples to {store.describe()}")
+    cases = store.replace_cases(cases_from_files(args.data))
+    print(f"Uploaded {count} counsellor examples and {cases} past cases to {store.describe()}")
 
 
 if __name__ == "__main__":

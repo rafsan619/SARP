@@ -6,11 +6,12 @@ sit behind it:
 | Part | Where it runs | Why |
 |---|---|---|
 | Website, chat engine, SARP-Net model | Vercel, Mumbai region (`bom1`) | Closest region to Dhaka |
-| Chats, call-backs, feedback, counsellor examples | Neon Postgres (free, added from inside Vercel) | Vercel has no permanent disk |
+| Cases, flags, feedback, past cases and counsellor examples | Neon Postgres (free, added from inside Vercel) | Vercel has no permanent disk |
 | AI replies (primary) | The team PC's RTX 3060, through a secure gateway and an ngrok link | Free, private, runs the fine-tuned model later |
 | AI replies (backup) | A free hosted open-model API (Groq or Google AI Studio) | Answers when the PC is off |
 
-If both AI options are down, students still get answers drawn from past counsellor conversations.
+If both AI options are down, counsellors still get a full structured answer built from the case rules and
+past cases, with a note that AI writing is offline.
 
 ## One-time setup
 
@@ -58,14 +59,14 @@ Check the provider's current model list and free limits first: they change often
 | `SARP_LLM_API_KEY` | the gateway key from step 4 |
 | `SARP_LLM_MODEL` | `gemma3:4b` (later: the fine-tuned model's Ollama name) |
 | `SARP_LLM_FALLBACK_BASE_URL`, `_API_KEY`, `_MODEL` | from step 3 |
-| `SARP_COUNSELLOR_PIN` | a PIN for the counsellor page (required: the page stays off without it) |
+| `SARP_COUNSELLOR_PIN` | the counsellors' PIN for the whole app (required: the app stays off without it) |
 | `SARP_POLITICAL_PHASE` | `Newly Elected` (or the current phase) |
 | `SARP_BDT_PER_USD` | `122` (update to today's rate) |
 | `DATABASE_URL` | set automatically by Neon |
 
-### 6. Upload the counsellor examples (once)
-The conversations are confidential and stay out of GitHub. Upload the example exchanges straight to the
-database from the PC that has the `data` folder (copy `DATABASE_URL` from **Storage, Neon, .env.local**):
+### 6. Upload the past cases and counsellor examples (once, and again after the data changes)
+The conversations are confidential and stay out of GitHub. Upload the past cases and example exchanges
+straight to the database from the PC that has the `data` folder (copy `DATABASE_URL` from **Storage, Neon, .env.local**):
 ```
 $env:DATABASE_URL = "<Neon connection string>"
 .venv\Scripts\python.exe -m agent.seed_examples
@@ -74,12 +75,14 @@ $env:DATABASE_URL = "<Neon connection string>"
 ### 7. Deploy
 Push the branch. Vercel builds a preview; open it and check:
 - the build log installs from `pyproject.toml` (not `requirements.txt`);
-- a chat streams a reply, the plan card fills in, and **/counsellor** asks for the PIN.
+- the site asks for the counsellor PIN, a case description streams a reply and the case sheet fills in;
+- **/team** shows the case with its verdict;
+- with the PC and backup both off, the reply still arrives with the "AI writing is offline" note.
 
 Then **Promote to Production**. Set `VERCEL_ANALYZE_BUILD_OUTPUT=1` once to see the bundle size.
 
 ## Day to day
-- **Before a demo:** start Ollama and `start_gateway.ps1` on the PC. The counsellor page header shows
+- **Before a demo:** start Ollama and `start_gateway.ps1` on the PC. The team overview page header shows
   whether "team PC" and "backup" are up.
 - **Switching to the fine-tuned model:** import it into Ollama on the PC
   (`ollama create sarp-agent -f Modelfile`), then set `SARP_LLM_MODEL=sarp-agent` in Vercel and
@@ -91,8 +94,8 @@ Then **Promote to Production**. Set `VERCEL_ANALYZE_BUILD_OUTPUT=1` once to see 
   Opening the page already starts this warm-up.
 
 ## Privacy
-- Student chats and call-back numbers are stored in Neon. Students see a note about this on the welcome
-  screen.
+- Case descriptions are stored in Neon. Only staff with the PIN can open the app. Counsellors should
+  describe the case without the student's full name, passport number or bank account details.
 - The backup AI provider receives messages only while the team PC is off.
 - Never commit `data/`, `agent_data/`, `.env` files or keys. `.gitignore` covers them, and
   `.vercelignore` uploads only the files the site needs.

@@ -51,6 +51,15 @@ examples_t = Table(
     Column("language", String(16)),
     Column("destination", String(64)),
 )
+cases_t = Table(  # past counselling cases (one per recorded conversation), for "similar cases"
+    "cases", metadata,
+    Column("id", String(32), primary_key=True),
+    Column("title", Text, nullable=False),
+    Column("destination", String(64)),
+    Column("language", String(16)),
+    Column("text", Text, nullable=False),
+    Column("advice", Text, nullable=False),
+)
 INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_conversations_client ON conversations (client_id, updated)",
     "CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages (conversation_id, id)",
@@ -209,3 +218,16 @@ class Store:
     def load_examples(self) -> list[dict]:
         with self.engine.connect() as db:
             return [dict(r._mapping) for r in db.execute(select(examples_t).order_by(examples_t.c.id))]
+
+    def replace_cases(self, rows: list[dict]) -> int:
+        keys = ("id", "title", "destination", "language", "text", "advice")
+        clean = [{k: r.get(k) for k in keys} for r in rows]
+        with self.engine.begin() as db:
+            db.execute(delete(cases_t))
+            if clean:
+                db.execute(insert(cases_t), clean)
+        return len(clean)
+
+    def load_cases(self) -> list[dict]:
+        with self.engine.connect() as db:
+            return [dict(r._mapping) for r in db.execute(select(cases_t).order_by(cases_t.c.id))]

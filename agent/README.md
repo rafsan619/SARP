@@ -1,10 +1,24 @@
-# SARP-Agent
+# SARP-Agent: virtual senior counsellor
 
-A study-abroad counselling chat website for students, built on the SARP-Net continuation model.
-Students chat in English, Banglish or Bengali; the agent answers their questions, builds their plan
-(destination, intake, budget, result, research level), scores it with SARP-Net and focuses its advice
-on what the model and the project's findings say matters most. Counsellors see the prediction, SHAP
-drivers and evidence for every chat.
+An AI assistant for the agency's counsellors, not for students, built on the SARP-Net continuation model.
+A counsellor describes a student's situation in English, Banglish or Bengali, the way they would tell a
+senior colleague. The assistant then:
+
+- **reads the case**: destination, level, course, result, English test, budget, bank statement, intake,
+  study gap, visa refusal and dependants;
+- **finds problems**: for example a bank statement under 28 days, a long study gap, a previous refusal,
+  low English, a funding gap or a missed intake. Each is marked as a blocker, a risk or a check;
+- **assesses eligibility**: likely eligible, potentially eligible, not yet eligible, or need more
+  information, with the reason and what is missing;
+- **suggests next steps**: what to verify, which documents to request, what to ask the student, the
+  possible pathways and what to tell the student;
+- **shows similar past cases**: the 200+ real agency conversations, with what our counsellor advised;
+- **scores continuation risk** with SARP-Net and explains the SHAP drivers with project evidence;
+- **trains new counsellors**: training mode explains why each step matters.
+
+The counsellor makes the final decision. They can correct any detail on the case sheet, dismiss a
+problem that doesn't apply, and flag a case for a senior counsellor. Senior counsellors see every case
+on the team overview page.
 
 ## Run it
 
@@ -18,32 +32,36 @@ drivers and evidence for every chat.
    ```
    .venv\Scripts\python.exe -m agent.server
    ```
-   Students: http://127.0.0.1:8000. Counsellors: http://127.0.0.1:8000/counsellor
+   - Case assistant: http://127.0.0.1:8000
+   - Team overview: http://127.0.0.1:8000/team
 
-Without Ollama the site still works in offline mode: answers come from past counsellor conversations.
+**Without an AI model the site still works.** If Ollama is off, or stops partway through a reply, the
+assistant says that AI writing is offline. It then gives a structured answer built from the case rules
+and past cases: the assessment, the problems, what to check, what to ask, the options and the next steps.
+The follow-up buttons (documents, pathways, what to tell the student, what else to ask) also work offline.
 
 To put the site online (Vercel, a free Neon database, the PC's GPU as the AI with a free hosted backup),
 follow [DEPLOY.md](DEPLOY.md).
 
-## How a reply is made
+## How an answer is made
 
 | Part | File | Source of truth |
 |---|---|---|
-| Reading details from chat | `extract.py` | Rules for English, Banglish and Bengali, plus quick-reply buttons |
-| Prediction and SHAP drivers | `risk_tool.py` | SARP-Net Gradient Boosting model, same code as the dashboard |
+| Reading the case from the counsellor's message | `extract.py`, `casebook.py` | Rules for English, Banglish and Bengali |
+| Problems, eligibility, checks, next steps | `casebook.py` | Agency case rules: entry requirements, 28-day bank rule, gap, refusal and English thresholds |
+| Similar past cases | `cases.py` | The agency's real counsellor conversations (problem type first, then wording) |
+| Continuation risk and SHAP drivers | `risk_tool.py` | SARP-Net Gradient Boosting model, same code as the dashboard |
 | Evidence for each driver | `findings.py` | `results_ablation/`, `experiments/results/e2_*`, `results_paper2/` |
-| Answers to open questions | `chat.py`, `llm.py` | Any OpenAI-compatible model (Ollama locally; team PC + backup online), given real counsellor answers to similar questions (`retriever.py`) |
+| Written answer | `chat.py`, `llm.py`, `prompts.py` | Any OpenAI-compatible model, given the case sheet, case rules, SARP-Net result and past cases. Without a model, the same material is laid out without AI |
 | PC model gateway | `llm_gateway.py`, `start_gateway.ps1` | Lets the online site use the PC's GPU safely |
-| Fixed wording (questions, plan, refusals) | `prompts.py` | Written in all three languages |
 | Storage | `store.py` | SQLite at `../agent_data/sarp_agent.db` on the PC; Postgres when `DATABASE_URL` is set |
-
-Students never see their probability or risk tier; only counsellors do.
 
 ## Data
 
-The counsellor-example search reads `../data/splits/train.jsonl` and `val.jsonl` (made by
-`data_prep/parse_conversations.py`, kept outside the repository because the conversations are
-confidential). The test split is never used, so it stays clean for evaluation.
+Past cases and counsellor examples come from `../data/splits/train.jsonl` and `val.jsonl`, made by
+`data_prep/parse_conversations.py`. They're kept outside the repository because the conversations are
+confidential. Online, `python -m agent.seed_examples` uploads them to the database. The test split is
+never used, so it stays clean for evaluation.
 
 ## Settings
 
@@ -53,12 +71,12 @@ confidential). The test split is never used, so it stays clean for evaluation.
 | `SARP_LLM_API_KEY` | empty | Key for that endpoint (the gateway key online) |
 | `SARP_LLM_MODEL` | `gemma3:4b` | Model name; set to the fine-tuned model's name once imported |
 | `SARP_LLM_FALLBACK_*` | not set | Optional backup AI (base URL, key, model) |
-| `DATABASE_URL` | not set | Postgres connection; without it chats go to SQLite |
+| `DATABASE_URL` | not set | Postgres connection; without it cases go to SQLite |
+| `SARP_COUNSELLOR_PIN` | not set | PIN for the whole app. Required online; optional on the PC |
 | `SARP_POLITICAL_PHASE` | `Newly Elected` | Phase used for every prediction |
 | `SARP_BDT_PER_USD` | `122` | Exchange rate for budgets given in taka |
-| `SARP_DATA_DIR` | `../data` | Folder holding `splits/` for counsellor examples |
-| `SARP_DB_PATH` | `../agent_data/sarp_agent.db` | Chat database |
-| `SARP_COUNSELLOR_PIN` | not set | If set, the counsellor page asks for this PIN |
+| `SARP_DATA_DIR` | `../data` | Folder holding `splits/` for past cases |
+| `SARP_DB_PATH` | `../agent_data/sarp_agent.db` | Case database |
 
 ## Tests
 

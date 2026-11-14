@@ -15,6 +15,7 @@ Settings (environment variables):
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from collections.abc import Iterator
@@ -27,6 +28,7 @@ DEFAULT_BASE_URL = "http://127.0.0.1:11434/v1"
 DEFAULT_MODEL = "gemma3:4b"
 # ngrok's free plan shows a browser warning page unless this header is present; other APIs ignore it.
 EXTRA_HEADERS = {"ngrok-skip-browser-warning": "1"}
+log = logging.getLogger("sarp.llm")  # warnings appear in Vercel's runtime logs
 # Reasoning that some models write into the reply itself (e.g. Gemma 4 on Google's API uses <thought>).
 THOUGHT_TAGS = ("thought", "think", "thinking", "reasoning")
 
@@ -227,7 +229,7 @@ class LLMRouter:
         problems = []
         for endpoint in self.endpoints:
             if not endpoint.available():
-                problems.append(f"{endpoint.name} unreachable")
+                problems.append(f"{endpoint.name} unreachable ({endpoint._problem or 'no reason'})")
                 continue
             started = False
             try:
@@ -239,10 +241,15 @@ class LLMRouter:
                     return
                 problems.append(f"{endpoint.name} sent an empty reply")
             except Exception as error:
-                endpoint.mark_down(f"reply failed ({type(error).__name__})")
+                detail = ""
+                if isinstance(error, httpx.HTTPStatusError):
+                    detail = f" HTTP {error.response.status_code}: {error.response.text[:200]}"
+                log.warning("%s model %s failed: %s%s", endpoint.name, endpoint.model, type(error).__name__, detail)
+                endpoint.mark_down(f"reply failed ({type(error).__name__}{detail[:80]})")
                 if started:
                     raise  # failed mid-reply: the chat engine adds a "cut short" note
                 problems.append(f"{endpoint.name}: {type(error).__name__}")
+        log.warning("No language model reachable: %s", "; ".join(problems))
         raise RuntimeError("No language model reachable (" + "; ".join(problems) + ")")
 
     def warm_up(self) -> None:

@@ -21,7 +21,8 @@ from agent.chat import ChatEngine, Turn
 from agent.llm import Endpoint, LLMRouter, strip_thoughts
 from agent.retriever import Retriever
 from agent.store import Store, database_url
-from agent.test_chat import NoExamples, tool
+from agent.cases import CaseLibrary
+from agent.test_chat import BANK_CASE, FakeLibrary, NoExamples, tool
 
 
 def sse(*pieces: str) -> bytes:
@@ -150,11 +151,35 @@ class LLMTest(unittest.TestCase):
     def test_offline_answers_when_everything_is_down(self):
         router = LLMRouter([Endpoint("primary", "https://pc.example/v1", "gemma3:4b", transport=down())])
         engine = ChatEngine(store=Store(Path(tempfile.mkdtemp()) / "t.db"), tool=tool(), llm=router,
-                            retriever=NoExamples())
+                            retriever=NoExamples(), library=FakeLibrary())
         engine.type_delay = 0
-        events = list(engine.handle(Turn(client_id="offline-client", text="What documents do I need for a UK visa?")))
+        events = list(engine.handle(Turn(client_id="offline-client", text=BANK_CASE)))
         reply = "".join(e["text"] for e in events if e["type"] == "token")
-        self.assertIn(P.GENERAL_REPLY["english"], reply)
+        self.assertIn("AI writing is offline", next(e["text"] for e in events if e["type"] == "notice"))
+        self.assertIn("Not yet eligible", reply)
+        self.assertIn(P.OFFLINE_NOTE, reply)
+
+    def test_ai_dropping_between_check_and_reply_is_handled(self):
+        """Ollama stops after the 30 s status check passed: the reply still arrives, from the rules."""
+        calls = {"n": 0}
+
+        def handler(request):
+            if request.url.path.endswith("/models"):
+                return httpx.Response(200, json={"data": [{"id": "gemma3:4b"}]})
+            calls["n"] += 1
+            raise httpx.ConnectError("Ollama stopped", request=request)
+        router = LLMRouter([Endpoint("primary", "http://127.0.0.1:11434/v1", "gemma3:4b",
+                                     transport=httpx.MockTransport(handler))])
+        engine = ChatEngine(store=Store(Path(tempfile.mkdtemp()) / "t.db"), tool=tool(), llm=router,
+                            retriever=NoExamples(), library=FakeLibrary())
+        engine.type_delay = 0
+        with self.assertLogs("sarp.llm", level="WARNING") as logs:
+            events = list(engine.handle(Turn(client_id="drop-client", text=BANK_CASE)))
+        self.assertEqual(calls["n"], 1)
+        self.assertTrue(any("ConnectError" in line for line in logs.output))
+        reply = "".join(e["text"] for e in events if e["type"] == "token")
+        self.assertIn("Not yet eligible", reply)
+        self.assertNotIn("error", [e["type"] for e in events])
 
     def test_settings_from_environment(self):
         env = {"SARP_LLM_BASE_URL": "https://pc.example/v1", "SARP_LLM_API_KEY": "k", "SARP_LLM_MODEL": "sarp-agent",
@@ -201,6 +226,20 @@ class StoreTests:
         self.assertEqual((retriever.source, len(retriever)), ("database", 1))
         self.assertEqual(retriever.search("Malaysia without IELTS?")[0]["conversation"], "c2-001")
 
+    def test_past_cases_from_database(self):
+        store = self.make_store()
+        rows = [{"id": "c2-010", "title": "Bank Statement Not 28 Days Old", "destination": "Malaysia",
+                 "language": "english", "text": "bank statement has not completed 28 days before the intake",
+                 "advice": json.dumps(["Move to the next intake or add a sponsor."])},
+                {"id": "c2-011", "title": "Bring a Pet", "destination": "UK", "language": "english",
+                 "text": "student asks about bringing a cat", "advice": json.dumps(["Check airline rules."])}]
+        self.assertEqual(store.replace_cases(rows), 2)
+        library = CaseLibrary(data_dir=Path(tempfile.mkdtemp()), store=store)
+        self.assertEqual((library.source, len(library)), ("database", 2))
+        found = library.similar("bank statement not ready", ["Bank Statement"])
+        self.assertEqual(found[0]["id"], "c2-010")
+        self.assertEqual(found[0]["advice"], ["Move to the next intake or add a sponsor."])
+
 
 class SQLiteStoreTest(StoreTests, unittest.TestCase):
     def make_store(self):
@@ -240,10 +279,19 @@ class ServerProtectionTest(unittest.TestCase):
     def setUp(self):
         engine = ChatEngine(store=Store(Path(tempfile.mkdtemp()) / "t.db"), tool=tool(),
                             llm=LLMRouter([Endpoint("primary", "https://pc.example/v1", "m", transport=down())]),
-                            retriever=NoExamples())
+                            retriever=NoExamples(), library=FakeLibrary())
         engine.type_delay = 0
         server._engine = engine
         self.client = TestClient(server.app)
+
+    def test_whole_app_needs_pin_online(self):
+        with mock.patch.dict(os.environ, {"VERCEL": "1", "SARP_COUNSELLOR_PIN": "4321"}):
+            body = {"client_id": "pin-browser-1", "text": BANK_CASE}
+            self.assertEqual(self.client.post("/api/chat", json=body).status_code, 401)
+            self.assertEqual(self.client.get("/api/status").status_code, 401)
+            self.assertEqual(self.client.get("/api/conversations", params={"client_id": "pin-browser-1"}).status_code, 401)
+            self.assertEqual(self.client.post("/api/chat", json=body, headers={"X-Counsellor-Pin": "4321"}).status_code, 200)
+            self.assertEqual(self.client.get("/").status_code, 200)  # the page itself loads and shows the PIN screen
 
     def test_counsellor_page_needs_pin_online(self):
         with mock.patch.dict(os.environ, {"VERCEL": "1"}, clear=False):

@@ -1,4 +1,4 @@
-"""Tests for the chat website's engine, text extraction and API.
+"""Tests for the counsellor assistant: case reading, assessment, engine (AI on, off and failing) and API.
 
 Run from the repository root:
     .venv/Scripts/python.exe -m unittest agent.test_chat -v
@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 
 from agent import prompts as P
 from agent import server
+from agent.casebook import assess, read_case
 from agent.chat import ChatEngine, Turn
 from agent.extract import detect_intent, extract
 from agent.language import detect_language
@@ -21,6 +22,7 @@ from agent.store import Store
 
 TODAY = date(2026, 11, 13)
 TOOL = None
+OFFLINE_NOTICE = "AI writing is offline right now"
 
 
 def tool() -> RiskTool:
@@ -33,14 +35,16 @@ def tool() -> RiskTool:
 class FakeLLM:
     model = "fake-model"
 
-    def __init__(self, available=True, reply="You will need your transcripts and passport."):
-        self._available, self.reply, self.calls = available, reply, []
+    def __init__(self, available=True, reply="**Main problem**\n- The bank statement is not ready.", fail=False):
+        self._available, self.reply, self.fail, self.calls = available, reply, fail, []
 
     def available(self, max_age=15.0):
         return self._available
 
     def stream_chat(self, messages, temperature=0.4):
         self.calls.append(messages)
+        if self.fail:  # e.g. Ollama switched off after the status check
+            raise RuntimeError("No language model reachable (primary: ConnectError)")
         yield self.reply[:12]
         yield self.reply[12:]
 
@@ -53,20 +57,43 @@ class NoExamples:
         return 0
 
 
+class FakeLibrary:
+    """Two past cases, so tests do not depend on the confidential conversation files."""
+    CASES = [{"id": "c1", "title": "Bank Statement Not 28 Days Old", "destination": "Malaysia",
+              "match": "same problem type", "advice": ["Delay to the next intake or use a sponsor."], "score": 1.0},
+             {"id": "c2", "title": "Study Gap Explanation", "destination": "UK",
+              "match": "similar wording", "advice": ["Ask for a gap explanation letter."], "score": 0.4}]
+
+    def similar(self, query, scenarios=None, k=3, min_score=0.15):
+        return self.CASES[:k]
+
+    def __len__(self):
+        return len(self.CASES)
+
+
 def make_engine(llm=None) -> ChatEngine:
     db = Path(tempfile.mkdtemp()) / "test.db"
-    engine = ChatEngine(store=Store(db), tool=tool(), llm=llm or FakeLLM(available=False), retriever=NoExamples())
+    engine = ChatEngine(store=Store(db), tool=tool(), llm=llm or FakeLLM(available=False),
+                        retriever=NoExamples(), library=FakeLibrary())
     engine.type_delay = 0
     return engine
 
 
-def run(engine, client, text, cid=None, qr=None, language=None):
-    events = list(engine.handle(Turn(client_id=client, text=text, conversation_id=cid, quick_reply=qr,
-                                     language=language)))
+def run(engine, client, text, cid=None, language=None, mode="case"):
+    events = list(engine.handle(Turn(client_id=client, text=text, conversation_id=cid, quick_reply=None,
+                                     language=language, mode=mode)))
     reply = "".join(e["text"] for e in events if e["type"] == "token")
     chips = next((e["chips"] for e in events if e["type"] == "chips"), [])
     cid = next(e["conversation_id"] for e in events if e["type"] == "meta")
     return cid, reply, chips, events
+
+
+def case_of(events) -> dict:
+    return next(e["case"] for e in events if e["type"] == "case")
+
+
+BANK_CASE = ("My student wants to study a Business bachelor's in Malaysia, but the bank statement has not "
+             "completed 28 days. HSC GPA 4.5, IELTS 6.0, budget 12 lakh. They want the January 2027 intake.")
 
 
 class ExtractTest(unittest.TestCase):
@@ -79,17 +106,10 @@ class ExtractTest(unittest.TestCase):
          {"country": "Australia", "budget_amount": 20.0, "budget_unit": "lakh_taka"}),
         ("আমি মালয়েশিয়ায় বিবিএ পড়তে চাই। কি কি ডকুমেন্ট লাগবে?", None,
          {"country": "Malaysia", "course": "Business Administration"}),  # no false "May" intake
-        ("Ami Canada te CSE porte chai, CGPA 3.2. Kivabe shuru korbo?", None,
-         {"country": "Canada", "course": "Computer Science", "gpa": 3.2, "gpa_scale": None}),
         ("January 2027 intake", None, {"intake": "2027-01"}),
         ("I may apply next year", None, {}),
         ("IELTS 6.5 and HSC GPA 5.00", None, {"gpa": 5.0, "gpa_scale": 5.0}),
-        ("IELTS result 5.5", None, {}),
-        ("3.4", "gpa", {"gpa": 3.4, "gpa_scale": None}),
-        ("september", "intake", {"intake": "2027-09"}),
         ("মে মাসে ভর্তি হতে চাই", None, {"intake": "2027-05"}),
-        ("I've shortlisted Monash and Deakin", "due_diligence",
-         {"institution": "Monash University", "due_diligence": "Yes Medium"}),
         ("$15k per year", None, {"budget_amount": 15000.0, "budget_unit": "usd"}),
     ]
 
@@ -98,117 +118,130 @@ class ExtractTest(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(extract(text, awaiting, TODAY)[0], expected)
 
-    def test_skip_when_unsure(self):
-        self.assertEqual(extract("not sure yet", "intake", TODAY), ({}, ["intake"]))
+    def test_intents_and_language(self):
+        self.assertEqual(detect_intent("Can the student edit the bank statement to show more money?"), "integrity")
+        self.assertEqual(detect_intent("Hello"), "greeting")
+        self.assertEqual(detect_language("Student er IELTS nai, ki korbo?"), "banglish")
+        self.assertEqual(detect_language("আমার স্টুডেন্টের ভিসা রিফিউজ হয়েছে"), "bengali")
 
-    def test_intents(self):
-        self.assertEqual(detect_intent("Can I edit my bank statement to show more money?"), "integrity")
-        self.assertEqual(detect_intent("I want to talk to a counsellor"), "handoff")
-        self.assertEqual(detect_intent("Hello bhaiya"), "greeting")
-        self.assertIsNone(detect_intent("What documents do I need?"))
 
-    def test_language(self):
-        self.assertEqual(detect_language("Ami UK te porte chai"), "banglish")
-        self.assertEqual(detect_language("আমি ইউকে যেতে চাই"), "bengali")
-        self.assertEqual(detect_language("I want to study in the UK"), "english")
-        self.assertIsNone(detect_language("ok"))
+class CasebookTest(unittest.TestCase):
+    def test_reads_problems_from_a_counsellor_description(self):
+        updates, mentioned = read_case("Student has a three-year study gap, a previous UK visa refusal and "
+                                       "wants to bring his wife. IELTS 5.5.", TODAY)
+        self.assertEqual(updates["gap_years"], 3)
+        self.assertTrue(updates["visa_refusal"])
+        self.assertTrue(updates["dependants"])
+        self.assertEqual((updates["english_test"], updates["english_score"]), ("IELTS", 5.5))
+        self.assertTrue({"study_gap", "visa_refusal", "dependants"} <= mentioned)
+
+    def test_refusal_country_is_not_the_destination(self):
+        self.assertEqual(read_case("The student also had a UK visa refusal last year.", TODAY)[0].get("country"), None)
+        updates, _ = read_case("Refused by Canada in 2024, now wants to study in Australia", TODAY)
+        self.assertEqual((updates["country"], updates["refusal_country"]), ("Australia", "Canada"))
+        updates, _ = read_case("আমার স্টুডেন্টের আগে কানাডার ভিসা রিফিউজ হয়েছে। এখন UK-তে মাস্টার্স করতে চায়।", TODAY)
+        self.assertEqual((updates["country"], updates["refusal_country"]), ("UK", "Canada"))
+
+    def test_bank_statement_not_ready_blocks_the_intake(self):
+        updates, mentioned = read_case(BANK_CASE, TODAY)
+        self.assertEqual(updates["bank_status"], "Not ready")
+        result = assess(updates, mentioned, TODAY)
+        self.assertEqual(result["verdict"], "Not yet eligible")
+        self.assertIn("bank_not_ready", [i["id"] for i in result["issues"]])
+
+    def test_thin_case_asks_for_more_information(self):
+        updates, mentioned = read_case("Student wants to go to Canada.", TODAY)
+        result = assess(updates, mentioned, TODAY)
+        self.assertEqual(result["verdict"], "Need more information")
+        self.assertTrue(result["missing"])
+
+    def test_complete_case_without_problems(self):
+        updates, mentioned = read_case("Master's in Computer Science in the UK, CGPA 3.6 out of 4, IELTS 7.0, "
+                                       "budget 30 lakh, bank statement ready, September 2027 intake.", TODAY)
+        self.assertIn(assess(updates, mentioned, TODAY)["verdict"], ("Likely eligible", "Potentially eligible"))
 
 
 class EngineTest(unittest.TestCase):
-    def test_collects_profile_then_shares_plan_with_findings(self):
-        engine = make_engine()
-        cid, reply, chips, _ = run(engine, "client-0001", "Ami UK te porte chai")
-        self.assertIn(P.QUESTIONS["intake"]["banglish"], reply)
-        self.assertEqual(chips[-1]["skip"], True)
-        cid, reply, chips, _ = run(engine, "client-0001", "January 2027", cid, {"field": "intake", "value": "2027-01"})
-        self.assertIn(P.QUESTIONS["budget"]["banglish"], reply)
-        cid, reply, chips, _ = run(engine, "client-0001", "18 lakh", cid)
-        self.assertIn(P.QUESTIONS["gpa"]["banglish"], reply)
-        self.assertIn("18 lakh taka", reply)  # the reply repeats back what it understood
-        cid, reply, chips, _ = run(engine, "client-0001", "3.1", cid)
-        self.assertEqual([c["value"] for c in chips if not c.get("skip")], P.DUE_DILIGENCE_VALUES)
-        cid, reply, chips, events = run(engine, "client-0001", "Ekhono kichu dekhini", cid,
-                                        {"field": "due_diligence", "value": "No"})
-        # The plan quotes the project's records for the current phase (Newly Elected: 18% vs up to 99%).
-        self.assertIn(P.RESEARCH_STEP["No"]["banglish"], reply)
-        self.assertIn("(18%)", reply)
-        self.assertIn("99%", reply)
-        self.assertTrue(reply.rstrip().endswith(P.PLAN_ASK["banglish"]))  # invites the student to continue
-        self.assertTrue(chips and all(c["kind"] == "suggest" for c in chips))
-        plan = next(e["plan"] for e in events if e["type"] == "plan")
-        self.assertTrue(plan["complete"])
-        state = engine.store.get_conversation(cid)["state"]
-        view = state["assessment"]["counsellor_view"]
-        self.assertEqual(view["risk_level"], "high")
-        # The student never sees their probability or risk tier.
-        transcript = " ".join(m["content"] for m in engine.store.messages(cid)).lower()
-        self.assertNotIn("risk", transcript)
-        self.assertNotIn(f"{view['probability'] * 100:.1f}", transcript)
-
-    def test_plan_message_continues_the_conversation(self):
-        """The Ireland chat from user testing: the plan must not read like a goodbye."""
-        engine = make_engine()
-        cid, _, _, _ = run(engine, "client-0008", "I want to study in Ireland")
-        cid, _, _, _ = run(engine, "client-0008", "September 2027", cid, {"field": "intake", "value": "2027-09"})
-        cid, _, _, _ = run(engine, "client-0008", "20 lakh taka or more", cid,
-                           {"field": "budget_band", "value": "16-20K"})
-        cid, reply, _, _ = run(engine, "client-0008", "cgpa 2.9", cid)
-        self.assertIn("Got it: 2.90 / 4.", reply)
-        cid, reply, chips, _ = run(engine, "client-0008", "I know the country and subject", cid,
-                                   {"field": "due_diligence", "value": "Yes Low"})
-        self.assertIn("Your plan is taking shape: Ireland, September 2027 intake", reply)
-        self.assertIn("Shortlist 3 to 5 courses or universities in Ireland", reply)
-        self.assertIn(P.COURSE_STEP["english"], reply)  # course not given yet
-        self.assertIn("September 2027 intake early", reply)
-        self.assertTrue(reply.rstrip().endswith(P.PLAN_ASK["english"]))
-        self.assertNotIn("well prepared", reply)
-        self.assertEqual([c["label"] for c in chips][:2],
-                         ["Help me choose a subject", "Which universities in Ireland suit me?"])
-        # Tapping a suggestion that repeats a known detail must not repeat the plan.
-        _, reply, _, _ = run(engine, "client-0008", "Which universities in Ireland suit me?", cid)
-        self.assertNotIn("Your plan is taking shape", reply)
-        # A real change (new country) does share an updated plan.
-        _, reply, _, _ = run(engine, "client-0008", "Actually I want to study in Canada", cid)
-        self.assertIn("Your plan is taking shape: Canada", reply)
-
-    def test_skip_is_not_asked_again(self):
-        engine = make_engine()
-        cid, _, _, _ = run(engine, "client-0002", "I want to study in Canada")
-        cid, reply, _, _ = run(engine, "client-0002", "Skip for now", cid, {"field": "intake", "value": None, "skip": True})
-        self.assertIn(P.QUESTIONS["budget"]["english"], reply)
-        self.assertIn("intake", engine.store.get_conversation(cid)["state"]["skipped"])
-
-    def test_document_tampering_is_refused(self):
-        engine = make_engine(FakeLLM(available=True))
-        _, reply, chips, _ = run(engine, "client-0003", "Can I edit my bank statement to show more money?")
-        self.assertIn(P.INTEGRITY_REPLY["english"], reply)
-        self.assertEqual(chips, [])
-        self.assertEqual(engine.llm.calls, [])  # fixed reply, the model is not asked
-
-    def test_model_answer_is_grounded_and_amounts_get_a_caveat(self):
-        llm = FakeLLM(available=True, reply="Canada usually needs about CAD 20,000 in your account.")
-        engine = make_engine(llm)
-        _, reply, _, _ = run(engine, "client-0004", "How much money do I need to show for a Canada study visa?")
-        self.assertTrue(reply.startswith("Canada usually needs"))
-        self.assertIn(P.AMOUNT_NOTE["english"], reply)
-        system = llm.calls[0][0]["content"]
-        self.assertIn(P.SYSTEM_PROMPT, system)
-        self.assertIn("Never mention risk", system)
-
-    def test_other_scripts_are_removed_from_model_replies(self):
-        engine = make_engine(FakeLLM(available=True, reply="வணக்கம்! আপনার পাসপোর্ট আর মার্কশিট লাগবে।"))
-        _, reply, _, _ = run(engine, "client-0007", "মালয়েশিয়ায় পড়তে কি কি ডকুমেন্ট লাগবে?")
-        self.assertTrue(reply.startswith("আপনার পাসপোর্ট"), reply)
-
-    def test_offline_mode_still_answers(self):
+    def test_offline_gives_a_full_case_answer_not_an_error(self):
         engine = make_engine(FakeLLM(available=False))
-        _, reply, _, _ = run(engine, "client-0005", "What documents do I need for a UK student visa?")
-        self.assertIn(P.GENERAL_REPLY["english"], reply)
+        _, reply, chips, events = run(engine, "client-0001", BANK_CASE)
+        types = [e["type"] for e in events]
+        self.assertEqual(types[0], "meta")
+        self.assertIn("case", types)
+        self.assertEqual(types[-1], "done")
+        notice = next(e["text"] for e in events if e["type"] == "notice")
+        self.assertIn(OFFLINE_NOTICE, notice)
+        self.assertNotIn("RuntimeError", json.dumps(events))
+        self.assertIn("Not yet eligible", reply)
+        self.assertIn("Bank statement", reply)
+        self.assertEqual(case_of(events)["assessment"]["verdict"], "Not yet eligible")
+        self.assertIn(P.FOLLOW_UPS["documents"], [c["label"] for c in chips])
 
-    def test_reply_language_follows_choice(self):
+    def test_ai_failing_after_the_status_check_falls_back(self):
+        """The reported bug: Ollama turned off on the PC showed 'AI model unavailable (RuntimeError)'."""
+        llm = FakeLLM(available=True, fail=True)
+        engine = make_engine(llm)
+        _, reply, _, events = run(engine, "client-0002", BANK_CASE)
+        self.assertEqual(len(llm.calls), 1)
+        self.assertIn(OFFLINE_NOTICE, next(e["text"] for e in events if e["type"] == "notice"))
+        self.assertNotIn("RuntimeError", reply)
+        self.assertIn("Not yet eligible", reply)
+        self.assertNotIn("error", [e["type"] for e in events])
+
+    def test_offline_follow_up_buttons_answer_from_the_rules(self):
+        engine = make_engine(FakeLLM(available=False))
+        cid, _, _, _ = run(engine, "client-0003", BANK_CASE)
+        for label, heading in [(P.FOLLOW_UPS["documents"], "Documents to request"),
+                               (P.FOLLOW_UPS["pathways"], "Possible pathways"),
+                               (P.FOLLOW_UPS["tell"], "What to tell the student"),
+                               (P.FOLLOW_UPS["missing"], "Ask the student next")]:
+            with self.subTest(label=label):
+                _, reply, _, _ = run(engine, "client-0003", label, cid=cid)
+                self.assertIn(heading, reply)
+
+    def test_ai_answer_is_grounded_in_the_case_sheet(self):
+        llm = FakeLLM(available=True)
+        engine = make_engine(llm)
+        _, reply, _, events = run(engine, "client-0004", BANK_CASE)
+        self.assertTrue(reply.startswith("**Main problem**"))
+        self.assertNotIn("notice", [e["type"] for e in events])
+        system = llm.calls[0][0]["content"]
+        self.assertIn(P.COUNSELLOR_SYSTEM, system)
+        self.assertIn("CASE RULE", system)
+        self.assertIn("PAST CASE: Bank Statement Not 28 Days Old", system)
+        self.assertIn("Not yet eligible", system)
+
+    def test_training_mode_uses_training_rules(self):
+        llm = FakeLLM(available=True, reply="In training: first check the bank statement date.")
+        engine = make_engine(llm)
+        run(engine, "client-0005", "How do I handle a student with a study gap?", mode="training")
+        self.assertIn(P.TRAINING_RULES.split("{")[0][:40], llm.calls[0][0]["content"])
+
+    def test_document_tampering_is_refused_without_the_model(self):
+        llm = FakeLLM(available=True)
+        engine = make_engine(llm)
+        _, reply, _, _ = run(engine, "client-0006", "Can the student edit the bank statement to show more money?")
+        self.assertIn(P.INTEGRITY_REPLY[:40], reply)
+        self.assertEqual(llm.calls, [])
+
+    def test_amounts_not_in_the_case_get_a_caveat(self):
+        engine = make_engine(FakeLLM(available=True, reply="Malaysia needs about MYR 45,000 in the account."))
+        _, reply, _, _ = run(engine, "client-0007", BANK_CASE)
+        self.assertIn("verify the current figure", reply)
+
+    def test_edit_dismiss_and_flag(self):
         engine = make_engine()
-        _, reply, _, _ = run(engine, "client-0006", "I want to study in the UK", language="bengali")
-        self.assertIn(P.QUESTIONS["intake"]["bengali"], reply)
+        cid, _, _, _ = run(engine, "client-0008", BANK_CASE)
+        sheet = engine.update_profile(cid, {"bank_status": "Ready", "country": "UK"})
+        self.assertNotIn("bank_not_ready", [i["id"] for i in sheet["assessment"]["issues"]])
+        self.assertEqual(sheet["raw"]["country"], "UK")
+        sheet = engine.update_profile(cid, {"visa_refusal": True})
+        self.assertIn("visa_refusal", [i["id"] for i in sheet["assessment"]["issues"]])
+        sheet = engine.update_profile(cid, {}, dismiss=["visa_refusal"])
+        self.assertNotIn("visa_refusal", [i["id"] for i in sheet["assessment"]["issues"]])
+        self.assertTrue(engine.set_flag(cid, True, "Please check the sponsor letter")["flag"])
+        summary = engine.counsellor_summary(engine.store.get_conversation(cid))
+        self.assertEqual(summary["flag"]["note"], "Please check the sponsor letter")
 
 
 class ApiTest(unittest.TestCase):
@@ -217,35 +250,49 @@ class ApiTest(unittest.TestCase):
         server._engine = make_engine()
         cls.client = TestClient(server.app)
 
-    def test_chat_stream_and_privacy(self):
-        body = {"client_id": "api-client-01", "text": "Ami Malaysia te porte chai, budget 10 lakh"}
+    def chat(self, client_id, text, **extra):
+        body = {"client_id": client_id, "text": text, **extra}
         with self.client.stream("POST", "/api/chat", json=body) as response:
             self.assertEqual(response.status_code, 200)
             raw = "".join(response.iter_text())
-        events = [json.loads(line[6:]) for line in raw.splitlines() if line.startswith("data: ")]
+        return [json.loads(line[6:]) for line in raw.splitlines() if line.startswith("data: ")]
+
+    def test_chat_stream_case_sheet_and_privacy(self):
+        events = self.chat("api-client-01", BANK_CASE)
         types = [e["type"] for e in events]
-        self.assertEqual(types[0], "meta")
-        self.assertIn("plan", types)
-        self.assertEqual(types[-1], "done")
+        self.assertEqual((types[0], types[-1]), ("meta", "done"))
+        self.assertIn("case", types)
+        self.assertIn("notice", types)  # the fake AI is offline
         cid = events[0]["conversation_id"]
-
-        student = self.client.get(f"/api/conversations/{cid}", params={"client_id": "api-client-01"}).json()
-        self.assertNotIn("assessment", json.dumps(student))
-        self.assertEqual(student["plan"]["items"]["country"], "Malaysia")
-        # Another browser cannot read this chat.
+        conv = self.client.get(f"/api/conversations/{cid}", params={"client_id": "api-client-01"}).json()
+        self.assertEqual(conv["case"]["assessment"]["verdict"], "Not yet eligible")
+        self.assertEqual(len(conv["messages"]), 2)
         self.assertEqual(self.client.get(f"/api/conversations/{cid}", params={"client_id": "someone-else"}).status_code, 404)
-        counsellor = self.client.get(f"/api/counsellor/conversations/{cid}").json()
-        self.assertEqual(counsellor["assessment"]["status"], "incomplete")
 
-    def test_callback_and_listing(self):
-        cid = self.client.post("/api/conversations", json={"client_id": "api-client-02"}).json()["id"]
-        result = self.client.post(f"/api/conversations/{cid}/callback", params={"client_id": "api-client-02"},
-                                  json={"name": "Rahim", "contact": "01700000000", "preferred_time": None}).json()
-        self.assertIn("Rahim", result["content"])
-        listed = self.client.get("/api/conversations", params={"client_id": "api-client-02"}).json()
-        self.assertEqual([c["id"] for c in listed], [cid])
-        summary = self.client.get("/api/counsellor/conversations").json()
-        self.assertTrue(any(c["handoff"] for c in summary["conversations"]))
+    def test_profile_flag_and_team_overview(self):
+        cid = self.chat("api-client-02", BANK_CASE)[0]["conversation_id"]
+        params = {"client_id": "api-client-02"}
+        sheet = self.client.post(f"/api/conversations/{cid}/profile", params=params,
+                                 json={"changes": {"bank_status": "Ready"}}).json()
+        self.assertNotEqual(sheet["assessment"]["verdict"], "Not yet eligible")
+        flag = self.client.post(f"/api/conversations/{cid}/flag", params=params,
+                                json={"flagged": True, "note": "Check funds"}).json()
+        self.assertEqual(flag["flag"]["note"], "Check funds")
+        listed = self.client.get("/api/conversations", params=params).json()
+        self.assertTrue(listed[0]["flagged"])
+        self.assertTrue(listed[0]["verdict"])
+        team = self.client.get("/api/counsellor/conversations").json()
+        self.assertTrue(any(c["flag"] for c in team["conversations"]))
+        detail = self.client.get(f"/api/counsellor/conversations/{cid}").json()
+        self.assertEqual(detail["case"]["flag"]["note"], "Check funds")
+        # Someone else's browser cannot edit the case.
+        self.assertEqual(self.client.post(f"/api/conversations/{cid}/flag", params={"client_id": "other-client"},
+                                          json={"flagged": False}).status_code, 404)
+
+    def test_pages(self):
+        self.assertEqual(self.client.get("/").status_code, 200)
+        self.assertIn("Team overview", self.client.get("/team").text)
+        self.assertEqual(self.client.get("/counsellor", follow_redirects=False).status_code, 307)
 
 
 if __name__ == "__main__":

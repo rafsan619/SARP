@@ -1,48 +1,56 @@
-"""The SARP-Agent conversation engine: one student message in, a stream of events out.
+"""SARP-Agent counsellor assistant: one counsellor message in, a stream of events out.
 
-Each turn:
- 1. Pick the reply language: the student's choice, or detected from their text.
- 2. Update the student's profile from a quick-reply button or from their text (agent/extract.py).
- 3. Score the profile with the SARP-Net model (agent/risk_tool.py). The full result is stored for
-    counsellors; the student never sees a probability or risk label.
- 4. Reply with
-    * fixed, translated text for profile answers, greetings, call-back requests and document-tampering
-      questions (instant and exactly worded);
-    * the language model for open questions, given real counsellor answers to similar questions;
-    * once the profile is complete, a plan built from the SHAP drivers and the agency records, so it
-      states the project's findings exactly.
- 5. Ask for the next missing detail, one at a time, with quick-reply buttons.
+Each conversation is a student case. For every message the engine
+ 1. reads case details from the counsellor's text (agent/casebook.py on top of agent/extract.py);
+ 2. assesses the case: eligibility verdict, problems found, missing information;
+ 3. scores the student with SARP-Net (continuation probability, SHAP drivers and project evidence);
+ 4. finds similar past cases from the agency's recorded conversations;
+ 5. answers: the language model writes the reply from all of the above; if no model is reachable, a
+    structured answer is built from the case rules and past cases, so the counsellor is never left
+    without help.
 
-Events yielded: meta, plan, token, chips, handoff, done, error.
+Events yielded: meta, case, token, notice, chips, done.
 """
 from __future__ import annotations
 
+import logging
 import re
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 
 from agent import prompts as P
-from agent.extract import detect_intent, extract
+from agent.cases import CaseLibrary
+from agent.casebook import BANK_STATES, ENGLISH_TESTS, ISSUES, LEVELS, assess, guidance, read_case
+from agent.extract import detect_intent
 from agent.language import LANGUAGES, detect_language
 from agent.llm import LLMRouter
 from agent.retriever import Retriever
-from agent.risk_tool import (COUNTRY_ALIASES, COURSE_ALIASES, INSTITUTION_ALIASES, REQUIRED_FIELDS, RiskTool,
-                             match_name)
+from agent.risk_tool import COUNTRY_ALIASES, COURSE_ALIASES, INSTITUTION_ALIASES, RiskTool, match_name
 from agent.store import Store
 
-PROFILE_KEYS = ["gpa", "gpa_scale", "course", "country", "institution", "budget_amount", "budget_unit",
-                "budget_band", "due_diligence", "intake"]
-QUICK_REPLY_KEYS = {"country", "intake", "budget_band", "due_diligence"}
-FIELD_OF_KEY = {"budget_amount": "budget", "budget_band": "budget", "budget_unit": "budget", "gpa_scale": "gpa"}
-LANG_KEYS = ("english", "banglish", "bengali")
+log = logging.getLogger("sarp.chat")
+
+SARP_KEYS = ["gpa", "gpa_scale", "course", "country", "institution", "budget_amount", "budget_unit",
+             "budget_band", "due_diligence", "intake"]
+EDITABLE = {"country", "level", "course", "institution", "intake", "gpa", "gpa_scale", "english_test",
+            "english_score", "budget_band", "budget_amount", "bank_status", "bank_days", "gap_years",
+            "visa_refusal", "dependants", "due_diligence", "notes"}
+# Which problem types each editable field decides (see casebook.assess).
+FIELD_ISSUES = {"bank_status": ("bank_not_ready",), "bank_days": ("bank_not_ready",),
+                "visa_refusal": ("visa_refusal",), "dependants": ("dependants",), "gap_years": ("study_gap",),
+                "english_test": ("english_low", "english_missing"), "english_score": ("english_low", "english_missing"),
+                "gpa": ("academic_below",), "gpa_scale": ("academic_below",), "intake": ("missed_intake",),
+                "budget_band": ("funding_gap",), "budget_amount": ("funding_gap",)}
+SARP_NEEDS = {"due_diligence": "research done by the student", "intake": "intake", "budget": "budget",
+              "gpa": "latest result", "country": "destination"}
+DUE_DILIGENCE = ["No", "Yes Low", "Yes Medium", "Yes High"]
 # Money amounts in a model reply ("CAD 10,000", "£1,334", "20 lakh", "৳৫০,০০০")
 AMOUNT_RE = re.compile(r"(?:[$£€৳]|\b(?:CAD|AUD|NZD|USD|GBP|EUR|RM|MYR|BDT|Tk)\.?)\s?[\d০-৯][\d০-৯,.]*|"
                        r"[\d০-৯][\d০-৯,.]*\s?(?:lakh|lac|crore|লাখ|কোটি|টাকা|taka|dollars?|pounds?|ডলার)", re.I)
 DIGITS_RE = re.compile(r"[\d০-৯][\d০-৯,.]*")
-# Small models sometimes slip into another Indic or Asian script (e.g. a Tamil greeting). Bengali
-# (U+0980-U+09FF) and Latin are kept; Devanagari, Gurmukhi to Sinhala, Thai, Japanese, Chinese and
-# Korean are removed while streaming.
+BN_TO_ASCII = str.maketrans("০১২৩৪৫৬৭৮৯", "0123456789")
+# Small models sometimes slip into another script; Bengali and Latin are kept.
 FOREIGN_SCRIPT_RE = re.compile(r"[ऀ-ॿ਀-෿฀-๿぀-ヿ一-鿿가-힯]+")
 
 
@@ -51,9 +59,10 @@ class Turn:
     client_id: str
     text: str
     conversation_id: str | None = None
-    quick_reply: dict | None = None
-    language: str | None = None  # "auto" or one of LANGUAGES
+    quick_reply: dict | None = None   # kept for API compatibility; suggestion chips send plain text
+    language: str | None = None       # "auto" or one of LANGUAGES
     client_ip: str | None = None
+    mode: str = "case"                # "case" (assessment) or "training"
 
 
 def make_title(text: str, limit: int = 48) -> str:
@@ -64,87 +73,121 @@ def make_title(text: str, limit: int = 48) -> str:
     return (cut or text[:limit]) + "…"
 
 
-def _pct(x: float, lang: str) -> str:
-    s = f"{x * 100:.0f}%"
-    return P.bn_digits(s) if lang == "bengali" else s
-
-
-def _num(x: float) -> str:
-    return f"{x:g}" if float(x) != int(x) else f"{int(x)}"
-
-
 class ChatEngine:
+    type_delay = 0.008  # seconds per word for fixed text (tests set 0)
+
     def __init__(self, store: Store | None = None, tool: RiskTool | None = None,
-                 llm: LLMRouter | None = None, retriever: Retriever | None = None):
+                 llm: LLMRouter | None = None, retriever: Retriever | None = None,
+                 library: CaseLibrary | None = None):
         self.store = store or Store()
         self.tool = tool or RiskTool()
         self.llm = llm or LLMRouter.from_env()
         self.retriever = retriever if retriever is not None else Retriever(store=self.store)
+        self.library = library if library is not None else CaseLibrary(store=self.store)
 
-    # ------------------------------------------------------------------ status and summaries
+    # ------------------------------------------------------------------ status
     def status(self) -> dict:
         return {"mode": "ai" if self.llm.available() else "offline", "model": self.llm.model,
-                "examples": len(self.retriever), "bdt_per_usd": self.tool.bdt_per_usd}
+                "examples": len(self.retriever), "cases": len(self.library), "bdt_per_usd": self.tool.bdt_per_usd}
 
     def detailed_status(self) -> dict:
-        """For counsellors: which AI endpoints are up and where data is stored (no secrets)."""
         describe = getattr(self.llm, "describe", None)
         return {**self.status(), "providers": describe() if describe else [],
                 "last_used": getattr(self.llm, "last_used", None), "storage": self.store.backend,
-                "examples_source": getattr(self.retriever, "source", None)}
+                "examples_source": getattr(self.retriever, "source", None),
+                "cases_source": getattr(self.library, "source", None)}
 
-    def plan_card(self, state: dict, lang: str) -> dict:
-        """The student's 'Your plan' card: what the agent knows so far, never any risk output."""
-        p, t = state.get("profile", {}), self.tool
-        lang = lang if lang in LANG_KEYS else "english"
+    # ------------------------------------------------------------------ the case sheet
+    def _profile_view(self, p: dict) -> list[dict]:
+        t = self.tool
 
         def canon(value, options, aliases):
             return (match_name(value, options, aliases) or value) if value else None
 
-        intake = None
-        if p.get("intake") and re.match(r"^\d{4}-\d{2}", str(p["intake"])):
-            year, month = int(p["intake"][:4]), int(p["intake"][5:7])
-            intake = f"{P.MONTHS_BN[month - 1]} {P.bn_digits(str(year))}" if lang == "bengali" \
-                else f"{P.MONTHS_EN[month - 1]} {year}"
         budget = None
         if p.get("budget_band"):
-            labels = {c["value"]: c["label"] for c in P.chips_for("budget", lang, t.bdt_per_usd) if not c.get("skip")}
-            budget = labels.get(p["budget_band"])
+            budget = {"Below 10k": "Under $10k a year", "10-15K": "$10-15k a year", "16-20K": "$16-20k a year"}.get(
+                p["budget_band"], p["budget_band"])
         elif p.get("budget_amount") is not None:
             amount, unit = float(p["budget_amount"]), p.get("budget_unit")
-            if unit == "lakh_taka" or (unit is None and amount < 1000):
-                budget = f"{P.bn_digits(_num(amount))} লাখ টাকা" if lang == "bengali" else f"{_num(amount)} lakh taka"
-            elif unit == "taka" or (unit is None and amount >= 100_000):
-                budget = f"{P.bn_digits(f'{amount:,.0f}')} টাকা" if lang == "bengali" else f"{amount:,.0f} taka"
-            else:
-                budget = f"${amount:,.0f}"
+            budget = (f"{amount:g} lakh taka" if unit == "lakh_taka" or (unit is None and amount < 1000)
+                      else f"{amount:,.0f} taka" if unit == "taka" else f"${amount:,.0f}")
         result = None
         if p.get("gpa") is not None:
-            gpa = float(p["gpa"])
-            scale = float(p.get("gpa_scale") or (5 if gpa > 4 else 4))
-            result = f"{gpa:.2f} / {scale:g}"
-            result = P.bn_digits(result) if lang == "bengali" else result
-        research = P.RESEARCH_LABELS[p["due_diligence"]][lang] if p.get("due_diligence") in P.RESEARCH_LABELS else None
-        country = canon(p.get("country"), t.countries, COUNTRY_ALIASES)
-        if country and lang == "bengali":
-            country = P.COUNTRY_BN.get(country, country)
-        items = {"country": country, "course": canon(p.get("course"), t.courses, COURSE_ALIASES),
-                 "institution": canon(p.get("institution"), t.institutions, INSTITUTION_ALIASES),
-                 "intake": intake, "budget": budget, "gpa": result, "research": research}
-        have = {"due_diligence": research, "intake": intake, "budget": budget, "gpa": result, "country": country}
-        return {"items": items, "skipped": state.get("skipped", []),
-                "complete": all(have[f] for f in REQUIRED_FIELDS)}
+            scale = p.get("gpa_scale") or (5 if float(p["gpa"]) > 4 else 4)
+            result = f"{float(p['gpa']):.2f} / {float(scale):g}"
+        english = None
+        if p.get("english_test"):
+            english = p["english_test"] + (f" {p['english_score']:g}" if p.get("english_score") is not None else "")
+        bank = p.get("bank_status")
+        if bank and p.get("bank_days") is not None:
+            bank = f"{bank} ({p['bank_days']} days held)"
+        intake = None
+        if p.get("intake") and re.match(r"^\d{4}-\d{2}", str(p["intake"])):
+            intake = f"{P.MONTHS_EN[int(p['intake'][5:7]) - 1]} {p['intake'][:4]}"
+        yes_no = {True: "Yes", False: "No"}
+        rows = [
+            ("country", "Destination", canon(p.get("country"), t.countries, COUNTRY_ALIASES)),
+            ("level", "Level", p.get("level")),
+            ("course", "Course", canon(p.get("course"), t.courses, COURSE_ALIASES)),
+            ("institution", "University", canon(p.get("institution"), t.institutions, INSTITUTION_ALIASES)),
+            ("intake", "Intake", intake),
+            ("gpa", "Latest result", result),
+            ("english_test", "English", english),
+            ("budget_band", "Budget", budget),
+            ("bank_status", "Bank statement", bank),
+            ("gap_years", "Study gap", f"{p['gap_years']} years" if p.get("gap_years") is not None
+             else (f"Passed {p['pass_year']}" if p.get("pass_year") else None)),
+            ("visa_refusal", "Visa refusal", (f"Yes ({p['refusal_country']})" if p.get("visa_refusal") and p.get("refusal_country")
+                                              else yes_no.get(p.get("visa_refusal")))),
+            ("dependants", "Dependants", yes_no.get(p.get("dependants"))),
+            ("due_diligence", "Research done", {"No": "Not yet", "Yes Low": "Country and subject",
+                                                "Yes Medium": "Shortlisted", "Yes High": "Well researched"}.get(
+                p.get("due_diligence"))),
+        ]
+        return [{"key": k, "label": label, "value": v} for k, label, v in rows]
+
+    def _assessment(self, state: dict) -> dict:
+        dismissed = set(state.get("dismissed", []))
+        mentioned = set(state.get("mentioned", [])) - dismissed
+        result = assess(state.get("profile", {}), mentioned)
+        result["issues"] = [i for i in result["issues"] if i["id"] not in dismissed]
+        return result
+
+    def _risk(self, state: dict) -> dict:
+        p = state.get("profile", {})
+        result = self.tool.assess({k: p[k] for k in SARP_KEYS if k in p})
+        state["assessment"] = result  # also read by the team overview page
+        if result["status"] != "ok":
+            return {"status": "incomplete", "needs": [SARP_NEEDS.get(m, m) for m in result["missing"]]}
+        view = result["counsellor_view"]
+        return {"status": "ok", "probability": view["probability"], "tier": view["risk_tier"],
+                "level": view["risk_level"], "cutoffs": view["cutoffs"],
+                "drivers": [{"label": d["label"], "direction": d["direction"], "shap": d["shap"],
+                             "evidence": d["evidence"][:2]} for d in view["drivers"][:3]],
+                "what_if": view["due_diligence_what_if"],
+                "warnings": [w["message"] for w in result["warnings"]
+                             if w["code"] in ("intake_after_training_period", "country_not_in_model")]}
+
+    def case_sheet(self, state: dict) -> dict:
+        return {"profile": self._profile_view(state.get("profile", {})),
+                "raw": {k: v for k, v in state.get("profile", {}).items() if k in EDITABLE},
+                "assessment": self._assessment(state), "risk": self._risk(state),
+                "similar": state.get("similar", []), "flag": state.get("flag"),
+                "notes": state.get("profile", {}).get("notes", ""),
+                "options": {"levels": LEVELS, "english_tests": ENGLISH_TESTS, "bank_states": BANK_STATES,
+                            "due_diligence": DUE_DILIGENCE, "countries": self.tool.countries}}
 
     @staticmethod
     def counsellor_summary(conv: dict) -> dict:
         state = conv.get("state") or {}
         assessment = state.get("assessment") or {}
         view = assessment.get("counsellor_view") or {}
-        return {"id": conv["id"], "title": conv.get("title") or "New chat", "updated": conv["updated"],
+        return {"id": conv["id"], "title": conv.get("title") or "New case", "updated": conv["updated"],
                 "language": state.get("language"), "message_count": conv.get("message_count"),
                 "status": assessment.get("status"), "risk_level": view.get("risk_level"),
                 "probability": view.get("probability"), "missing": assessment.get("missing", []),
-                "handoff": state.get("handoff")}
+                "verdict": state.get("verdict"), "flag": state.get("flag"), "handoff": state.get("flag")}
 
     # ------------------------------------------------------------------ one turn
     def handle(self, turn: Turn) -> Iterator[dict]:
@@ -153,22 +196,19 @@ class ChatEngine:
             conv = self.store.create_conversation(turn.client_id)
         cid = conv["id"]
         state = conv["state"] or {}
-        for key, default in (("profile", {}), ("skipped", []), ("asked", {})):
-            state.setdefault(key, default)
+        state.setdefault("profile", {})
+        state.setdefault("mentioned", [])
         yield {"type": "meta", "conversation_id": cid, "title": conv["title"]}
 
         text = turn.text.strip()
-        self.store.add_message(cid, "user", text, {"quick_reply": turn.quick_reply} if turn.quick_reply else None,
-                               client_id=turn.client_id, client_ip=turn.client_ip)
-        detected = None if turn.quick_reply else detect_language(text)
-        lang = turn.language if turn.language in LANGUAGES else (detected or state.get("language") or "english")
+        self.store.add_message(cid, "user", text, client_id=turn.client_id, client_ip=turn.client_ip)
+        lang = turn.language if turn.language in LANGUAGES else (detect_language(text) or state.get("language") or "english")
         state["language"] = lang
+        mode = "training" if turn.mode == "training" or text == P.FOLLOW_UPS["train"] else "case"
 
-        # Profile
-        awaiting = state.get("awaiting")
-        updates, skipped = self._read_profile(turn, text, awaiting)
+        # Update the case from what the counsellor wrote.
+        updates, mentioned = read_case(text)
         profile = state["profile"]
-        before = dict(profile)
         if "budget_band" in updates:
             profile.pop("budget_amount", None)
             profile.pop("budget_unit", None)
@@ -177,226 +217,223 @@ class ChatEngine:
         if "gpa" in updates:
             profile.pop("gpa_scale", None)
         profile.update({k: v for k, v in updates.items() if v is not None})
-        learned = {FIELD_OF_KEY.get(k, k) for k, v in updates.items() if v is not None}
-        # Only a real change re-shares the plan: "Which universities in Ireland suit me?" repeats the country.
-        changed = {FIELD_OF_KEY.get(k, k) for k, v in updates.items() if v is not None and before.get(k) != v}
-        state["skipped"] = [f for f in dict.fromkeys(state["skipped"] + skipped) if f not in learned]
+        state["mentioned"] = sorted(set(state["mentioned"]) | mentioned)
 
-        intent = None if turn.quick_reply else detect_intent(text)
-        words = len(text.split())
-        answered = bool(awaiting) and (awaiting in learned or awaiting in skipped)
-        data_only = bool(turn.quick_reply) or (answered and words <= 8 and "?" not in text) or \
-            (bool(learned) and intent is None and words <= 6 and "?" not in text)
+        sheet = self._refresh(state, text)
+        yield {"type": "case", "case": sheet}
 
-        # Score with SARP-Net (stored for counsellors only)
-        result = self.tool.assess({k: profile[k] for k in PROFILE_KEYS if k in profile})
-        state["assessment"] = result
-        missing = result.get("missing", []) if result["status"] == "incomplete" else []
-        next_field = None
-        if intent not in ("handoff", "integrity"):
-            next_field = next((f for f in P.CONVERSATION_ORDER if f in missing and f not in state["skipped"]
-                               and state["asked"].get(f, 0) < 2), None)
-        share_plan = result["status"] == "ok" and (not state.get("plan_shared") or bool(changed & set(REQUIRED_FIELDS)))
-        yield {"type": "plan", "plan": self.plan_card(state, lang)}
-
-        after = []  # fixed text that follows the main answer
-        plan_chips: list[dict] = []
-        if share_plan:
-            plan_text, plan_chips = self._plan_text(result, state, lang)
-            after.append(plan_text)
-        if next_field:
-            after.append(P.QUESTIONS[next_field][lang])
-
-        if intent == "integrity":
-            head = P.INTEGRITY_REPLY[lang]
-        elif intent == "handoff":
-            head = P.HANDOFF_REPLY[lang]
-        elif intent == "greeting":
-            head = P.GREETING_REPLY[lang]
-        elif data_only:
-            head = "" if share_plan else self._ack(state, learned, skipped, lang)  # the plan recaps instead
-        else:
-            head = None  # open question: the language model answers
-
+        intent = detect_intent(text)
         message_id = self.store.add_message(cid, "assistant", "")
         out: list[str] = []
-        chips = P.chips_for(next_field, lang, self.tool.bdt_per_usd) if next_field else plan_chips
+        chips = self._follow_ups(sheet, mode)
         try:
-            if head is None:
-                yield from self._model_answer(cid, text, lang, state, result, share_plan, out)
-                if after:
-                    yield from self._typewriter("\n\n" + "\n\n".join(after), out)
+            if intent == "integrity":
+                yield from self._typewriter(P.INTEGRITY_REPLY, out)
+            elif intent == "greeting" and not updates and not mentioned:
+                yield from self._typewriter(P.GREETING_REPLY, out)
             else:
-                yield from self._typewriter("\n\n".join(x for x in [head, *after] if x), out)
+                yield from self._answer(cid, lang, mode, state, sheet, out)
             if chips:
                 yield {"type": "chips", "chips": chips}
-            if intent == "handoff":
-                yield {"type": "handoff"}
         finally:
-            # Saved even if the student presses stop mid-reply.
             self.store.update_message(message_id, "".join(out).strip(), {"chips": chips})
-            if next_field:
-                state["asked"][next_field] = state["asked"].get(next_field, 0) + 1
-            state["awaiting"] = next_field
-            if share_plan:
-                state["plan_shared"] = True
             title = conv["title"] or make_title(text)
             self.store.update_conversation(cid, title=title, state=state)
         if not conv["title"]:
             yield {"type": "meta", "conversation_id": cid, "title": title}
         yield {"type": "done", "message_id": message_id}
 
-    # ------------------------------------------------------------------ helpers
-    @staticmethod
-    def _read_profile(turn: Turn, text: str, awaiting: str | None) -> tuple[dict, list[str]]:
-        qr = turn.quick_reply
-        if qr:
-            key = qr.get("field")
-            if qr.get("skip"):
-                field = FIELD_OF_KEY.get(key, key)
-                return {}, [field] if field in REQUIRED_FIELDS else []
-            if key in QUICK_REPLY_KEYS and qr.get("value") is not None:
-                return {key: qr["value"]}, []
-            return {}, []
-        return extract(text, awaiting)
+    def _refresh(self, state: dict, text: str = "") -> dict:
+        assessment = self._assessment(state)
+        scenarios = [s for i in assessment["issues"] for s in ISSUES[i["id"]]["scenarios"]]
+        query = " ".join([text] + [i["title"] for i in assessment["issues"]] + [state["profile"].get("country") or ""])
+        if text or not state.get("similar"):
+            state["similar"] = self.library.similar(query, scenarios, k=3)
+        state["verdict"] = assessment["verdict"]
+        return self.case_sheet(state)
 
-    type_delay = 0.012  # seconds per word for fixed text (tests set 0)
-
+    # ------------------------------------------------------------------ answers
     def _typewriter(self, text: str, out: list[str]) -> Iterator[dict]:
-        """Stream fixed text word by word so every reply feels the same to the student."""
         for piece in re.findall(r"\S+\s*|\s+", text):
             out.append(piece)
             yield {"type": "token", "text": piece}
             if self.type_delay:
                 time.sleep(self.type_delay)
 
-    def _ack(self, state: dict, learned: set, skipped: list, lang: str) -> str:
-        """Short reply to a profile answer that repeats back what was understood."""
-        if skipped and not learned:
-            return P.SKIP_ACK[lang]
-        items = self.plan_card(state, lang)["items"]
-        order = ["country", "course", "institution", "intake", "budget", "gpa", "due_diligence"]
-        key = {"due_diligence": "research"}
-        values = [items[key.get(f, f)] for f in order if f in learned and items.get(key.get(f, f))]
-        return P.ACK_DETAIL[lang].format(items=", ".join(values)) if values else P.ack(lang)
+    @staticmethod
+    def _follow_ups(sheet: dict, mode: str) -> list[dict]:
+        keys = []
+        if sheet["assessment"]["issues"]:
+            keys += ["pathways", "documents", "tell"]
+        if sheet["assessment"]["missing"]:
+            keys.append("missing")
+        if mode == "case":
+            keys.append("train")
+        return [{"label": P.FOLLOW_UPS[k], "kind": "suggest"} for k in keys[:4]]
 
-    def _plan_text(self, result: dict, state: dict, lang: str) -> tuple[str, list[dict]]:
-        """The plan message (recap, next steps, records fact, question) and its suggested follow-ups."""
-        items = self.plan_card(state, lang)["items"]
-        focus = result["student_guidance"]["focus"]
-        research = state["profile"].get("due_diligence", "No")
-        country, intake = items.get("country") or "", items.get("intake") or ""
+    def _case_context(self, sheet: dict) -> str:
+        known = "; ".join(f"{r['label']}: {r['value']}" for r in sheet["profile"] if r["value"]) or "nothing yet"
+        a = sheet["assessment"]
+        lines = [f"CASE SHEET\nKnown details: {known}.",
+                 f"Eligibility (rule-based): {a['verdict']}. {a['reason']}",
+                 "Checks: " + "; ".join(f"{c['area']}: {c['state']} ({c['note']})" for c in a["checks"])]
+        if a["missing"]:
+            lines.append("Missing information: " + ", ".join(a["missing"]))
+        for g in guidance([i["id"] for i in a["issues"]][:3]):
+            lines.append(f"\nCASE RULE: {g['title']} ({g['severity']}). {g['summary']}\n"
+                         f"Check: {'; '.join(g['check'])}\nAsk the student: {'; '.join(g['ask'])}\n"
+                         f"Documents: {'; '.join(g['documents'])}\nPathways: {'; '.join(g['pathways'])}\n"
+                         f"Tell the student: {g['tell']}")
+        r = sheet["risk"]
+        if r["status"] == "ok":
+            drivers = "; ".join(f"{d['label']} {d['direction']} ({' '.join(d['evidence'][:1])})" for d in r["drivers"])
+            lines.append(f"\nSARP-NET (agency model, 6,000 records): continuation probability {r['probability']:.0%}, "
+                         f"{r['tier']}. Main drivers: {drivers}")
+        else:
+            lines.append("\nSARP-NET: not scored yet; needs " + ", ".join(r["needs"]))
+        for c in sheet["similar"]:
+            lines.append(f"\nPAST CASE: {c['title']}\nWhat our counsellor advised: " + " | ".join(c["advice"][:2]))
+        return "\n".join(lines)
 
-        parts = [items["country"], items.get("course")]
-        parts += [P.SUMMARY_PARTS[k][lang].format(v=items[k]) for k in ("intake", "budget", "gpa") if items.get(k)]
-        summary = P.PLAN_SUMMARY[lang].format(summary=", ".join(p for p in parts if p))
-
-        # Next steps: where the student is now, then what SARP-Net says is pulling their prediction down.
-        steps = [P.RESEARCH_STEP.get(research, P.RESEARCH_STEP["No"])[lang].format(country=country)]
-        for f in focus:
-            if f == "help_research":
-                continue  # covered by the research step above
-            if f == "timing":
-                steps.append(P.DEADLINE_STEP[lang].format(intake=intake))
-            else:
-                steps.append(P.STUDENT_TOPICS[f][lang])
-        if not items.get("course"):
-            steps.append(P.COURSE_STEP[lang])
-        if "timing" not in focus and intake:
-            steps.append(P.DEADLINE_STEP[lang].format(intake=intake))
-        steps = list(dict.fromkeys(steps))[:4]
-
-        lines = [summary, "", P.NEXT_STEPS_INTRO[lang], ""] + [f"- {s}" for s in steps]
-        if "help_research" in focus:
-            phase = result["counsellor_view"]["model_profile"]["Political_Phase"]
-            rates = self.tool.findings.due_diligence_by_phase.get(phase)
-            if rates:
-                high = max(rates[level] for level in ("Yes Low", "Yes Medium", "Yes High"))
-                lines += ["", P.RESEARCH_FACT[lang].format(hi=_pct(high, lang), lo=_pct(rates["No"], lang))]
-        lines += ["", P.PLAN_ASK[lang]]
-
-        keys = (["choose_course"] if not items.get("course") else []) + ["universities", "documents"]
-        keys.append("budget" if "funding_plan" in focus else "scholarship")
-        chips = [{"label": P.SUGGESTIONS[k][lang].format(country=country), "kind": "suggest"} for k in keys]
-        return "\n".join(lines), chips
-
-    def _known_details(self, state: dict) -> str:
-        items = self.plan_card(state, "english")["items"]
-        names = {"country": "Destination", "course": "Course", "institution": "University", "intake": "Intake",
-                 "budget": "Yearly budget", "gpa": "Latest result", "research": "Research done"}
-        return "; ".join(f"{names[k]}: {v}" for k, v in items.items() if v) or "none yet"
-
-    def _model_answer(self, cid: str, text: str, lang: str, state: dict, result: dict, share_plan: bool,
-                      out: list[str]) -> Iterator[dict]:
-        # A high bar: weak matches share words but not meaning, and short replies only made sense in their own
-        # chat; a small model copies both. Without a good example it answers from general knowledge.
-        examples = self.retriever.search(text, lang, k=2, min_score=0.4, min_answer_words=20)
+    def _answer(self, cid: str, lang: str, mode: str, state: dict, sheet: dict, out: list[str]) -> Iterator[dict]:
         if self.llm.available():
-            context = [P.SYSTEM_PROMPT, P.REPLY_RULES.format(language=P.LANGUAGE_NAMES[lang]),
-                       f"Details the student has already shared: {self._known_details(state)}."]
-            if result["status"] == "ok" and result["student_guidance"]["topics"]:
-                context.append("Where this student most needs support (bring in naturally only when relevant): "
-                               + " ".join(result["student_guidance"]["topics"]))
-            context.append("The app adds its own follow-up question after your reply"
-                           + (" and a short personal plan" if share_plan else "")
-                           + ", so answer only what the student asked and do not ask for their details.")
-            if examples:
-                context.append("Past answers our counsellors gave OTHER students in other conversations. Use one only "
-                               "if it clearly answers this student's question; never copy its wording, never start "
-                               "with its 'Yes' or 'No', and ignore personal details that do not apply:\n\n"
-                               + "\n\n".join(f"Student: {e['question']}\nCounsellor: {e['answer']}" for e in examples))
-            system = "\n\n".join(context)
-            messages = [{"role": "system", "content": system}]
+            rules = (P.TRAINING_RULES if mode == "training" else P.CASE_RULES).format(language=P.LANGUAGE_NAMES[lang])
+            system = "\n\n".join([P.COUNSELLOR_SYSTEM, rules, self._case_context(sheet)])
             history = [m for m in self.store.messages(cid) if m["content"].strip()]
-            messages += [{"role": m["role"], "content": m["content"]} for m in history[-12:]]
+            messages = [{"role": "system", "content": system}]
+            messages += [{"role": m["role"], "content": m["content"]} for m in history[-10:]]
             try:
                 for chunk in self.llm.stream_chat(messages):
                     chunk = FOREIGN_SCRIPT_RE.sub("", chunk)
                     if not "".join(out).strip():
-                        chunk = chunk.lstrip(" !.,:;-–—\n")  # drop punctuation left by a removed word
-                    if not chunk:
-                        continue
-                    out.append(chunk)
-                    yield {"type": "token", "text": chunk}
-                # Guard: amounts the model states that are not in the counsellor examples get a caveat.
-                grounded = {d.translate(str.maketrans("০১২৩৪৫৬৭৮৯", "0123456789")).replace(",", "")
-                            for d in DIGITS_RE.findall(system)}
+                        chunk = chunk.lstrip(" !.,:;-–—\n")
+                    if chunk:
+                        out.append(chunk)
+                        yield {"type": "token", "text": chunk}
+                grounded = {d.translate(BN_TO_ASCII).replace(",", "") for d in DIGITS_RE.findall(system)}
                 stated = [DIGITS_RE.search(a).group(0) for a in AMOUNT_RE.findall("".join(out))]
-                if any(s.translate(str.maketrans("০১২৩৪৫৬৭৮৯", "0123456789")).replace(",", "").rstrip(".")
-                       not in grounded for s in stated):
-                    yield from self._typewriter("\n\n" + P.AMOUNT_NOTE[lang], out)
+                if any(s.translate(BN_TO_ASCII).replace(",", "").rstrip(".") not in grounded for s in stated):
+                    yield from self._typewriter("\n\n_Amounts change often: verify the current figure with the "
+                                                "university or the official visa page._", out)
                 return
-            except Exception as error:  # model stopped or unreachable: fall back below
+            except Exception as error:
+                log.warning("AI reply failed: %s", error)
                 if out:
-                    note = "\n\n_(The reply was cut short. Please try again.)_"
-                    out.append(note)
-                    yield {"type": "token", "text": note}
+                    yield from self._typewriter("\n\n_(The AI reply was cut short. Please send the message again.)_", out)
                     return
-                yield {"type": "notice", "text": f"AI model unavailable ({type(error).__name__}); "
-                                                 "showing answers from past counsellor conversations."}
-        if examples and examples[0]["score"] >= 0.3:
-            reply = f"{P.RETRIEVED_PREFIX[lang]}\n\n> " + examples[0]["answer"].replace("\n", "\n> ")
+        yield {"type": "notice", "text": "AI writing is offline right now; this answer comes from the case rules "
+                                         "and past cases."}
+        question = self.store.messages(cid)[-2]["content"] if len(self.store.messages(cid)) >= 2 else ""
+        signature = f"{sheet['assessment']['verdict']}|{[i['id'] for i in sheet['assessment']['issues']]}|" \
+                    f"{sorted((r['key'], r['value']) for r in sheet['profile'] if r['value'])}"
+        answer = self.offline_followup(question, sheet)
+        if answer is None:
+            if state.get("offline_signature") == signature and mode == "case":
+                answer = ("I can't answer that specific question while the AI writer is offline, and nothing new "
+                          f"about the case has changed (still **{sheet['assessment']['verdict']}**). The case sheet "
+                          "shows the full assessment; try this question again when the AI is back.\n\n" + P.OFFLINE_NOTE)
+            else:
+                answer = self.offline_answer(sheet, mode)
+        state["offline_signature"] = signature
+        yield from self._typewriter(answer, out)
+
+    @staticmethod
+    def offline_followup(question: str, sheet: dict) -> str | None:
+        """Answer the follow-up buttons from the case rules alone."""
+        rules = guidance([i["id"] for i in sheet["assessment"]["issues"]])
+        q = question.strip()
+
+        def section(title: str, field: str, n: int = 6) -> str:
+            items: list[str] = []
+            for g in rules:
+                for item in g[field]:
+                    if item not in items:
+                        items.append(item)
+            return f"**{title}**\n" + "\n".join(f"- {x}" for x in items[:n]) + "\n\n" + P.OFFLINE_NOTE
+
+        if q == P.FOLLOW_UPS["documents"] and rules:
+            return section("Documents to request", "documents")
+        if q == P.FOLLOW_UPS["pathways"] and rules:
+            return section("Possible pathways", "pathways")
+        if q == P.FOLLOW_UPS["tell"] and rules:
+            return "**What to tell the student**\n" + "\n".join(f"- {g['title']}: {g['tell']}" for g in rules) + \
+                "\n\n" + P.OFFLINE_NOTE
+        if q == P.FOLLOW_UPS["train"]:
+            return ChatEngine.offline_answer(sheet, "training")
+        if q == P.FOLLOW_UPS["missing"]:
+            asks = [f"- {m}" for m in sheet["assessment"]["missing"]]
+            for g in rules:
+                asks += [f"- {x}" for x in g["ask"] if f"- {x}" not in asks]
+            return "**Ask the student next**\n" + "\n".join(asks[:8]) + "\n\n" + P.OFFLINE_NOTE
+        return None
+
+    @staticmethod
+    def offline_answer(sheet: dict, mode: str = "case") -> str:
+        """A structured case answer built only from the case rules and past cases (no AI model)."""
+        a = sheet["assessment"]
+        known = ", ".join(f"{r['label'].lower()} {r['value']}" for r in sheet["profile"] if r["value"])
+        parts = [f"**Assessment: {a['verdict']}.** {a['reason']}"]
+        if known:
+            parts.append(f"Case so far: {known}.")
+        rules = guidance([i["id"] for i in a["issues"]])
+        if rules:
+            parts.append("**Main problem" + ("s" if len(rules) > 1 else "") + "**\n" +
+                         "\n".join(f"- {g['title']}: {g['summary']}" for g in rules))
+
+            def merged(field: str, n: int = 5) -> list[str]:
+                seen: list[str] = []
+                for g in rules[:2]:
+                    for item in g[field]:
+                        if item not in seen:
+                            seen.append(item)
+                return seen[:n]
+
+            parts.append("**Check first**\n" + "\n".join(f"- {x}" for x in merged("check")))
+            parts.append("**Ask the student**\n" + "\n".join(f"- {x}" for x in merged("ask")))
+            parts.append("**Options**\n" + "\n".join(f"- {x}" for x in merged("pathways")))
+            parts.append("**Documents to request**\n" + "\n".join(f"- {x}" for x in merged("documents", 4)))
+            parts.append(f"**What to tell the student**\n{rules[0]['tell']}")
         else:
-            reply = P.GENERAL_REPLY[lang]
-        yield from self._typewriter(reply, out)
+            parts.append("No specific problem found from what you have described so far.")
+        if a["missing"]:
+            parts.append("**Find out next**\n" + "\n".join(f"- {m}" for m in a["missing"][:6]))
+        if sheet["similar"]:
+            parts.append("**Similar past cases**\n" + "\n".join(f"- {c['title']}" for c in sheet["similar"]))
+        if mode == "training":
+            parts.append("**Training tip:** start every case by filling the missing details, then deal with blockers "
+                         "(funds, English, results) before choosing universities.")
+        parts.append(P.OFFLINE_NOTE)
+        return "\n\n".join(parts)
 
-    # ------------------------------------------------------------------ other actions
-    def request_callback(self, conversation_id: str, name: str, contact: str, preferred_time: str | None) -> dict:
+    # ------------------------------------------------------------------ counsellor actions
+    def update_profile(self, conversation_id: str, changes: dict, dismiss: list[str] | None = None,
+                       restore: list[str] | None = None) -> dict:
         conv = self.store.get_conversation(conversation_id)
         state = conv["state"] or {}
-        state["handoff"] = {"name": name, "contact": contact, "preferred_time": preferred_time,
-                            "requested_at": time.time()}
-        lang = state.get("language", "english")
-        when = P.HANDOFF_WHEN[lang].format(time=preferred_time) if preferred_time else ""
-        text = P.HANDOFF_CONFIRM[lang].format(name=name, contact=contact, when=when)
-        message_id = self.store.add_message(conversation_id, "assistant", text)
+        profile = state.setdefault("profile", {})
+        for key, value in changes.items():
+            if key not in EDITABLE:
+                continue
+            if value in (None, ""):
+                profile.pop(key, None)
+            else:
+                profile[key] = value
+        if "budget_band" in changes and changes["budget_band"]:
+            profile.pop("budget_amount", None)
+            profile.pop("budget_unit", None)
+        # A detail the counsellor set by hand overrides problems read from their earlier wording; the
+        # assessment re-derives the problem from the field itself when it still applies.
+        overridden = {issue for key in changes for issue in FIELD_ISSUES.get(key, ())}
+        state["mentioned"] = sorted(set(state.get("mentioned", [])) - overridden)
+        dismissed = set(state.get("dismissed", [])) | set(dismiss or [])
+        state["dismissed"] = sorted(dismissed - set(restore or []))
+        sheet = self._refresh(state)
         self.store.update_conversation(conversation_id, state=state)
-        return {"message_id": message_id, "content": text}
+        return sheet
 
-    def reset_plan(self, conversation_id: str) -> dict:
+    def set_flag(self, conversation_id: str, flagged: bool, note: str | None = None) -> dict:
         conv = self.store.get_conversation(conversation_id)
         state = conv["state"] or {}
-        for key in ("profile", "skipped", "asked", "awaiting", "plan_shared", "assessment"):
-            state.pop(key, None)
+        state["flag"] = {"note": note or "", "at": time.time()} if flagged else None
         self.store.update_conversation(conversation_id, state=state)
-        return self.plan_card(state, state.get("language", "english"))
+        return {"flag": state["flag"]}

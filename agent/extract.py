@@ -50,7 +50,7 @@ COURSE_PATTERNS = [(name, re.compile(_nfc(p), flags)) for name, p, flags in [
     ("Computer Science", r"computer science|\bcse\b|কম্পিউটার সায়েন্স|সিএসই", re.I),
     ("Data Science", r"data science|ডেটা সায়েন্স", re.I),
     ("Business Analytics", r"business analytics", re.I),
-    ("Business Administration", r"business administration|\bmba\b|\bbba\b|বিজনেস|বিবিএ|এমবিএ", re.I),
+    ("Business Administration", r"business administration|\bmba\b|\bbba\b|\bbusiness\b(?!\s*analytics)|বিজনেস|বিবিএ|এমবিএ", re.I),
     ("Software Engineering", r"software engineering", re.I),
     ("Cyber Security", r"cyber ?security", re.I),
     ("Electrical Engineering", r"electrical|\beee\b", re.I),

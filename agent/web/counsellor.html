@@ -3,13 +3,13 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>SARP-Agent | Counsellor insights</title>
+  <title>SARP-Agent | Team overview</title>
   <meta name="robots" content="noindex">
   <link rel="icon" href="/static/icon.svg" type="image/svg+xml">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Anek+Bangla:wdth,wght@75..125,300..800&family=Hind+Siliguri:wght@400;500;600&display=swap">
-  <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="/static/styles.css?v=20261115c">
   <script>
     try {
       const saved = localStorage.getItem("sarp.theme");
@@ -20,15 +20,20 @@
 </head>
 <body>
   <div class="c-app" id="app">
-    <aside class="c-list" aria-label="Student chats">
-      <h1>Counsellor insights</h1>
+    <aside class="c-list" aria-label="All cases">
+      <h1>Team overview</h1>
       <p class="sub" id="modelCard">Loading…</p>
+      <div class="c-filters" role="radiogroup" aria-label="Show">
+        <button type="button" role="radio" data-filter="all" aria-checked="true">All cases</button>
+        <button type="button" role="radio" data-filter="flagged" aria-checked="false">Flagged for review</button>
+      </div>
       <div id="list"></div>
+      <a class="team-link" href="/">Back to the case assistant</a>
     </aside>
     <main class="c-detail" id="detail">
-      <p class="c-empty">Choose a chat to see the student's plan, SARP-Net prediction and transcript.</p>
+      <p class="c-empty">Choose a case to see the AI assessment, SARP-Net prediction and the conversation.</p>
     </main>
   </div>
-  <script src="/static/counsellor.js" type="module"></script>
+  <script src="/static/counsellor.js?v=20261115c" type="module"></script>
 </body>
 </html>
