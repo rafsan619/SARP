@@ -297,11 +297,19 @@ class ChatEngine:
 
     def _answer(self, cid: str, lang: str, mode: str, state: dict, sheet: dict, out: list[str]) -> Iterator[dict]:
         if self.llm.available():
-            rules = (P.TRAINING_RULES if mode == "training" else P.CASE_RULES).format(language=P.LANGUAGE_NAMES[lang])
-            system = "\n\n".join([P.COUNSELLOR_SYSTEM, rules, self._case_context(sheet)])
             history = [m for m in self.store.messages(cid) if m["content"].strip()]
+            answered = any(m["role"] == "assistant" for m in history)
+            # The full case template only for the first answer; later turns answer just the new question,
+            # otherwise the model repeats the whole assessment every time.
+            rules = P.TRAINING_RULES if mode == "training" else P.FOLLOW_UP_RULES if answered else P.CASE_RULES
+            system = "\n\n".join([P.COUNSELLOR_SYSTEM, rules.format(language=P.LANGUAGE_NAMES[lang]),
+                                  self._case_context(sheet)])
             messages = [{"role": "system", "content": system}]
-            messages += [{"role": m["role"], "content": m["content"]} for m in history[-10:]]
+            for m in history[-8:]:
+                content = m["content"]
+                if m["role"] == "assistant" and len(content) > 600:  # a short memory of earlier answers is enough
+                    content = content[:600].rsplit("\n", 1)[0] + "\n[earlier answer shortened]"
+                messages.append({"role": m["role"], "content": content})
             try:
                 for chunk in self.llm.stream_chat(messages):
                     chunk = FOREIGN_SCRIPT_RE.sub("", chunk)

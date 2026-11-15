@@ -211,6 +211,16 @@ class EngineTest(unittest.TestCase):
         self.assertIn("PAST CASE: Bank Statement Not 28 Days Old", system)
         self.assertIn("Not yet eligible", system)
 
+    def test_follow_ups_do_not_repeat_the_full_assessment(self):
+        llm = FakeLLM(available=True)
+        engine = make_engine(llm)
+        cid, _, _, _ = run(engine, "client-0009", BANK_CASE)
+        run(engine, "client-0009", P.FOLLOW_UPS["pathways"], cid=cid)
+        first, second = llm.calls[0][0]["content"], llm.calls[1][0]["content"]
+        self.assertIn(P.CASE_RULES.splitlines()[0], first)
+        self.assertIn(P.FOLLOW_UP_RULES.splitlines()[0], second)
+        self.assertNotIn(P.CASE_RULES.splitlines()[0], second)
+
     def test_training_mode_uses_training_rules(self):
         llm = FakeLLM(available=True, reply="In training: first check the bank statement date.")
         engine = make_engine(llm)

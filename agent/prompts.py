@@ -33,7 +33,8 @@ LANGUAGE_NAMES = {
 }
 
 CASE_RULES = """How to answer the counsellor:
-- Write in {language}. Address the counsellor ("your student"), never the student directly.
+- Write in {language}. You are talking to the counsellor about their student; never address the student, and do not
+  open with a greeting or a salutation. Start directly with the first section.
 - If they ask a specific question, answer it first. Otherwise use these short headed sections, skipping any that do not apply:
   **Main problem**, **Check first**, **Ask the student**, **Options** (compare them briefly), **Next steps**, **What to tell the student**.
 - Keep it under 250 words. Use short lists.
@@ -41,6 +42,15 @@ CASE_RULES = """How to answer the counsellor:
 - Do not state exact fees, deadlines or visa amounts as facts unless they appear below; say what to verify instead.
 - If you name universities or courses, present them as options to verify, not guarantees.
 - If key information is missing, end by listing what the counsellor should find out."""
+
+FOLLOW_UP_RULES = """How to answer this follow-up from the counsellor:
+- Write in {language}. You already gave the full case assessment earlier in this conversation. Do NOT repeat it,
+  and do not reuse the section headings (Main problem, Check first, Ask the student...) unless asked.
+- Answer only what the counsellor asked now, directly, starting with the answer. No greeting or salutation.
+- If their message adds new facts about the student, say briefly what these change in the assessment and what to
+  do differently; skip everything that stays the same.
+- If they ask to compare options, give each option with when it fits, its main risk and what to verify.
+- Keep it under 180 words. Base it on the case sheet, case rules and past cases below; say what must be verified."""
 
 TRAINING_RULES = """Training mode: the counsellor is new and wants to learn how to handle this kind of case.
 - Write in {language}. Coach them like a senior colleague.
