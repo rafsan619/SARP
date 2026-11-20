@@ -513,3 +513,4 @@ dialog::backdrop { background: rgba(10, 22, 18, .45); }
 .panel .cs-block:first-of-type { margin-top: 12px; }
 .c-list { overflow-x: hidden; }
 .c-item, .c-item .row { min-width: 0; }
+.transcript .m .content { white-space: normal; font-size: .93rem; line-height: 1.55; }

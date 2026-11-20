@@ -1,7 +1,8 @@
 // Team overview for senior counsellors: every case, its AI assessment, SARP-Net prediction and flags.
 
+import { esc, markdown } from "./markdown.js?v=20261120";
+
 const $ = (id) => document.getElementById(id);
-const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const pct = (x) => `${(x * 100).toFixed(1)}%`;
 const when = (ts) => new Date(ts * 1000).toLocaleString([], { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
 const VERDICT_CLASS = { "Likely eligible": "ok", "Potentially eligible": "maybe", "Not yet eligible": "no", "Need more information": "info" };
@@ -126,7 +127,7 @@ async function loadDetail(id) {
         ${sheet.similar.length ? `<section class="panel"><h3>Similar past cases</h3>${sheet.similar.map((c) => `
           <details class="cs-case"><summary><span>${esc(c.title)}</span><em>${esc(c.match)}</em></summary><ul>${c.advice.map((x) => `<li>${esc(x)}</li>`).join("")}</ul></details>`).join("")}</section>` : ""}
         <section class="panel transcript"><h3>Conversation</h3>${d.messages.map((m) => `
-          <div class="m ${m.role}"><div class="who">${m.role === "user" ? "Counsellor" : "SARP-Agent"}${m.feedback ? (m.feedback > 0 ? ", marked helpful" : ", marked not helpful") : ""}</div>${esc(m.content)}</div>`).join("")}
+          <div class="m ${m.role}"><div class="who">${m.role === "user" ? "Counsellor" : "SARP-Agent"}${m.feedback ? (m.feedback > 0 ? ", marked helpful" : ", marked not helpful") : ""}</div>${m.role === "user" ? esc(m.content) : `<div class="content">${markdown(m.content)}</div>`}</div>`).join("")}
         </section>
       </div>
     </div></div>`;
